@@ -1,0 +1,7 @@
+pytesseract
+pdf2docx
+python-pptx
+openpyxl
+weasyprint
+pymupdf4llm
+deep-translator

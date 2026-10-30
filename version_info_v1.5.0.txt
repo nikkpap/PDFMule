@@ -1,0 +1,7 @@
+PDF Mule
+Version: 1.5.0
+Product: PDF Mule Local PDF Studio
+Build type: Python / PyQt6 desktop source
+Core engine: PyMuPDF + Pillow
+Batch engine: QThread controller + isolated multiprocessing workers for independent PDF jobs
+Visual tools: Visual Merge, Visual Organize, Visual / Batch Split

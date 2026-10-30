@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.part
+build/
+dist/
+*.spec
+pdfs-test/
+PDFMule_v*.pyw
