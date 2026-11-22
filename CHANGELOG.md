@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.6.1 — automatic install of Tesseract, Ghostscript and LibreOffice
+
+- Tesseract OCR, Ghostscript and LibreOffice are installed automatically the first time a tool needs them (Windows: winget or the official signed installers with one UAC prompt; Mac: Homebrew, or Terminal installs Homebrew; LibreOffice also from the official disk image; Linux: apt/dnf/pacman with sudo/pkexec).
+- OCR languages live in ~/.pdf_mule/tessdata: English, Greek and orientation (osd) are set up with Tesseract; any other language is copied from the Tesseract installation or downloaded when a document needs it. The searchable-PDF support files are provided too.
+- Batches install what they need once before the parallel workers start.
+- Dependency status: "Install missing programs" installs all three at once.
+- Release check: a new CI job installs the programs on fresh Windows, Mac (with and without Homebrew) and Linux machines and runs a Greek OCR, a PDF/A and a Word → PDF conversion.
+
 ## v1.6.0 — Windows, Mac and Linux releases with self-update
 
 - GitHub Actions builds and publishes each version as a release: Windows .exe (optionally code-signed), macOS app for Apple silicon and Intel (ad-hoc signed, or Developer ID + notarized when the secrets are set), Linux binary, and the .pyw. Every build is smoke-tested before release.

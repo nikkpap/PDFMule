@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Any
 
 APP_NAME = "PDF Mule"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 BUILD_DATE = "2026-11-22"
 APP_HOME = Path.home() / ".pdf_mule"
 SETTINGS_FILE = APP_HOME / "settings.json"
@@ -620,6 +620,381 @@ def find_tesseract() -> Optional[str]:
 
 def find_soffice() -> Optional[str]:
     return find_exe(["soffice", "soffice.exe", "libreoffice"])
+
+
+# ----------------------------------------------------------------------------------------------
+# External programs: installed automatically the first time a tool needs them.
+#   Tesseract OCR  → OCR, translation of scans      Ghostscript → PDF/A, strong compression
+#   LibreOffice    → Word / PowerPoint / Excel → PDF
+# Windows: winget, else the official installer (one Windows "Yes" prompt).
+# Mac: Homebrew; without Homebrew, Terminal opens and installs it (asks the Mac password once).
+#      LibreOffice without Homebrew: the official disk image, copied to Applications.
+# Linux: apt / dnf / pacman (asks for the password with the system's dialog).
+# OCR languages are downloaded into ~/.pdf_mule/tessdata as they are needed.
+# ----------------------------------------------------------------------------------------------
+import threading as _threading
+
+TESSDATA_DIR = APP_HOME / "tessdata"
+TESSDATA_URL = "https://raw.githubusercontent.com/tesseract-ocr/tessdata/main/{code}.traineddata"
+_INSTALL_LOCK = _threading.Lock()
+
+PROGRAMS = {
+    "tesseract": {"label": "Tesseract OCR", "find": lambda: find_tesseract(),
+                  "winget": "UB-Mannheim.TesseractOCR", "brew": ["tesseract"],
+                  "apt": ["tesseract-ocr"], "dnf": ["tesseract"], "pacman": ["tesseract"]},
+    "ghostscript": {"label": "Ghostscript", "find": lambda: find_ghostscript(),
+                    "winget": "ArtifexSoftware.GhostScript", "brew": ["ghostscript"],
+                    "apt": ["ghostscript"], "dnf": ["ghostscript"], "pacman": ["ghostscript"]},
+    "libreoffice": {"label": "LibreOffice", "find": lambda: find_soffice(),
+                    "winget": "TheDocumentFoundation.LibreOffice", "brew": ["--cask", "libreoffice"],
+                    "apt": ["libreoffice-writer", "libreoffice-calc", "libreoffice-impress"],
+                    "dnf": ["libreoffice-writer", "libreoffice-calc", "libreoffice-impress"],
+                    "pacman": ["libreoffice-fresh"]},
+}
+
+
+def _say(progress, value, message):
+    if progress:
+        progress(value, message)
+
+
+def _ssl_ctx():
+    import ssl
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(cafile=certifi.where())
+    except Exception:
+        pass
+    return ctx
+
+
+def _fetch_text(url: str, timeout: int = 30) -> str:
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": f"PDFMule/{APP_VERSION}",
+                                               "Accept": "application/vnd.github+json, text/html, */*"})
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx()) as r:
+        return r.read(4_000_000).decode("utf-8", "replace")
+
+
+def _download(url: str, dest: Path, progress=None, label: str = "Downloading", lo: int = 5, hi: int = 60):
+    """Download to dest (via dest.part), reporting progress between lo and hi percent."""
+    import urllib.request
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + f".{os.getpid()}.part")
+    req = urllib.request.Request(url, headers={"User-Agent": f"PDFMule/{APP_VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=60, context=_ssl_ctx()) as r, open(tmp, "wb") as out:
+            total = int(r.headers.get("Content-Length") or 0); got = 0; shown = -1
+            while True:
+                chunk = r.read(512 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk); got += len(chunk)
+                pct = got * 100 // total if total else -1
+                if pct != shown:
+                    shown = pct
+                    _say(progress, lo + (hi - lo) * max(0, pct) // 100,
+                         f"{label}… {got / 1e6:.0f}" + (f" of {total / 1e6:.0f} MB" if total else " MB"))
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dest
+
+
+def _github_latest_asset(repo: str, pattern: str) -> str:
+    data = json.loads(_fetch_text(f"https://api.github.com/repos/{repo}/releases/latest"))
+    for a in data.get("assets") or []:
+        if re.search(pattern, a.get("name", ""), re.I):
+            return a["browser_download_url"]
+    raise RuntimeError(f"No installer found in the latest {repo} release.")
+
+
+def _refresh_found():
+    _find_exe_cached.cache_clear()
+    _system_tessdata_dir.cache_clear()
+    importlib.invalidate_caches()
+
+
+def _run_install_cmd(cmd, timeout=3600, env=None):
+    cp = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout,
+                        env=env, **_no_window_kwargs())
+    return cp.returncode, (cp.stdout or "") + (cp.stderr or "")
+
+
+# ---- Windows ----
+def _win_signature_ok(path: Path, signer_hint: str) -> bool:
+    """Authenticode check of a downloaded installer (must be Valid and from the expected publisher)."""
+    env = dict(os.environ, PDFMULE_FILE=str(path)); env.pop("PSModulePath", None)
+    code, out = _run_install_cmd(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                                  "$s=Get-AuthenticodeSignature -LiteralPath $env:PDFMULE_FILE; "
+                                  "if ($s.Status -ne 'Valid') { Write-Output $s.Status; exit 1 }; "
+                                  "$s.SignerCertificate.Subject"], timeout=120, env=env)
+    return code == 0 and signer_hint.lower() in out.lower()
+
+
+def _win_run_elevated(exe: str, args: str, timeout: int = 3600) -> int:
+    """Run an installer as administrator (Windows shows one Yes/No prompt) and wait for it."""
+    ps = ("$p = Start-Process -FilePath $env:PDFMULE_EXE -ArgumentList $env:PDFMULE_ARGS -Verb RunAs "
+          "-Wait -PassThru; exit $p.ExitCode")
+    env = dict(os.environ, PDFMULE_EXE=exe, PDFMULE_ARGS=args); env.pop("PSModulePath", None)
+    code, out = _run_install_cmd(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+                                 timeout=timeout, env=env)
+    if code != 0 and ("canceled by the user" in out.lower() or "cancelled by the user" in out.lower()):
+        raise RuntimeError("The installation was cancelled at the Windows permission prompt. "
+                           "Run the tool again and answer Yes.")
+    return code
+
+
+def _install_windows(key: str, progress) -> None:
+    info = PROGRAMS[key]
+    winget = shutil.which("winget")
+    if winget and not os.environ.get("PDFMULE_NO_WINGET"):
+        _say(progress, 10, f"Installing {info['label']} with Windows Package Manager…")
+        code, out = _run_install_cmd([winget, "install", "-e", "--id", info["winget"], "--silent",
+                                      "--accept-package-agreements", "--accept-source-agreements",
+                                      "--disable-interactivity"])
+        _refresh_found()
+        if info["find"]():
+            return
+        _say(progress, 15, f"Windows Package Manager did not finish ({code}); using the official installer")
+    with tempfile.TemporaryDirectory(prefix="pdfmule_setup_") as td:
+        if key == "tesseract":
+            url = _github_latest_asset("UB-Mannheim/tesseract", r"w64-setup.*\.exe$")
+            exe = _download(url, Path(td) / Path(url).name, progress, f"Downloading {info['label']}")
+            signer, args = "", "/S"
+        elif key == "ghostscript":
+            url = _github_latest_asset("ArtifexSoftware/ghostpdl-downloads", r"^gs\d+w64\.exe$")
+            exe = _download(url, Path(td) / Path(url).name, progress, f"Downloading {info['label']}")
+            signer, args = "Artifex", "/S"
+        else:
+            ver = _libreoffice_latest()
+            url = (f"https://download.documentfoundation.org/libreoffice/stable/{ver}/win/x86_64/"
+                   f"LibreOffice_{ver}_Win_x86-64.msi")
+            msi = _download(url, Path(td) / Path(url).name, progress, f"Downloading {info['label']} {ver}")
+            if not _win_signature_ok(msi, "Document Foundation"):
+                raise RuntimeError("The LibreOffice download failed its signature check. Nothing was installed.")
+            _say(progress, 65, f"Installing {info['label']} (answer Yes at the Windows prompt)…")
+            code = _win_run_elevated("msiexec.exe", f'/i "{msi}" /qn /norestart')
+            if code not in (0, 3010):
+                raise RuntimeError(f"The LibreOffice installer stopped with code {code}.")
+            return
+        if signer and not _win_signature_ok(exe, signer):
+            raise RuntimeError(f"The {info['label']} download failed its signature check. Nothing was installed.")
+        _say(progress, 65, f"Installing {info['label']} (answer Yes at the Windows prompt)…")
+        code = _win_run_elevated(str(exe), args)
+        if code != 0:
+            raise RuntimeError(f"The {info['label']} installer stopped with code {code}.")
+
+
+def _libreoffice_latest() -> str:
+    page = _fetch_text("https://download.documentfoundation.org/libreoffice/stable/")
+    vers = sorted({v for v in re.findall(r'href="(\d+\.\d+\.\d+)/"', page)},
+                  key=lambda v: tuple(int(x) for x in v.split(".")))
+    if not vers:
+        raise RuntimeError("Could not find the current LibreOffice version.")
+    return vers[-1]
+
+
+# ---- macOS ----
+def _brew() -> Optional[str]:
+    if os.environ.get("PDFMULE_NO_BREW"):   # release check of the no-Homebrew path
+        return None
+    for p in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew", shutil.which("brew") or ""):
+        if p and Path(p).exists():
+            return p
+    return None
+
+
+def _install_mac(key: str, progress) -> None:
+    info = PROGRAMS[key]
+    brew = _brew()
+    if brew:
+        _say(progress, 10, f"Installing {info['label']} with Homebrew (a few minutes)…")
+        env = dict(os.environ, HOMEBREW_NO_AUTO_UPDATE="1", HOMEBREW_NO_INSTALL_CLEANUP="1",
+                   NONINTERACTIVE="1", PATH=f"{Path(brew).parent}:/usr/bin:/bin:/usr/sbin:/sbin")
+        code, out = _run_install_cmd([brew, "install", *info["brew"]], env=env)
+        _refresh_found()
+        if info["find"]() or code == 0:
+            return
+        if key != "libreoffice":
+            raise RuntimeError(f"Homebrew could not install {info['label']}:\n{out[-600:]}")
+    if key == "libreoffice":
+        _install_mac_libreoffice(progress); return
+    # No Homebrew: Terminal installs it (the Mac asks for the password there), then the program.
+    script = APP_HOME / "install_tools.command"
+    script.write_text("#!/bin/bash\n"
+                      "echo 'PDF Mule is installing Homebrew, Tesseract OCR and Ghostscript.'\n"
+                      "echo 'Type your Mac password when asked (nothing shows while typing), then press Enter.'\n"
+                      "echo\n"
+                      "if ! command -v brew >/dev/null && [ ! -x /opt/homebrew/bin/brew ] && [ ! -x /usr/local/bin/brew ]; then\n"
+                      "  /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"\n"
+                      "fi\n"
+                      "eval \"$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv)\"\n"
+                      "brew install tesseract ghostscript\n"
+                      "echo; echo 'Done. You can close this window and go back to PDF Mule.'\n", encoding="utf-8")
+    script.chmod(0o755)
+    subprocess.Popen(["/usr/bin/open", "-a", "Terminal", str(script)])
+    deadline = time.time() + 45 * 60
+    while time.time() < deadline:
+        _say(progress, 40, "Finish the installation in the Terminal window (it asks for your Mac password)…")
+        time.sleep(3)
+        _refresh_found()
+        if info["find"]():
+            return
+    raise RuntimeError(f"{info['label']} was not installed. Finish the steps in the Terminal window and try again.")
+
+
+def _install_mac_libreoffice(progress) -> None:
+    import platform
+    arch = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86-64"
+    folder = "aarch64" if arch == "aarch64" else "x86_64"
+    ver = _libreoffice_latest()
+    url = (f"https://download.documentfoundation.org/libreoffice/stable/{ver}/mac/{folder}/"
+           f"LibreOffice_{ver}_MacOS_{arch}.dmg")
+    with tempfile.TemporaryDirectory(prefix="pdfmule_lo_") as td:
+        dmg = _download(url, Path(td) / "LibreOffice.dmg", progress, f"Downloading LibreOffice {ver}", 5, 80)
+        mnt = Path(td) / "mnt"
+        _say(progress, 85, "Copying LibreOffice to Applications…")
+        subprocess.run(["/usr/bin/hdiutil", "attach", "-nobrowse", "-quiet", "-mountpoint", str(mnt), str(dmg)],
+                       check=True, timeout=300)
+        try:
+            app = next(mnt.glob("LibreOffice*.app"))
+            target_dir = Path("/Applications") if os.access("/Applications", os.W_OK) else Path.home() / "Applications"
+            target_dir.mkdir(exist_ok=True)
+            target = target_dir / "LibreOffice.app"
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+            subprocess.run(["/usr/bin/ditto", str(app), str(target)], check=True, timeout=900)
+        finally:
+            subprocess.run(["/usr/bin/hdiutil", "detach", "-quiet", str(mnt)], timeout=120)
+        code, _ = _run_install_cmd(["/usr/bin/codesign", "--verify", "--deep", str(target)], timeout=300)
+        if code != 0:
+            shutil.rmtree(target, ignore_errors=True)
+            raise RuntimeError("The LibreOffice download failed its signature check. Nothing was installed.")
+        subprocess.run(["/usr/bin/xattr", "-dr", "com.apple.quarantine", str(target)], timeout=120)
+
+
+# ---- Linux ----
+def _install_linux(key: str, progress) -> None:
+    info = PROGRAMS[key]
+    for manager, kind, cmd in (("apt-get", "apt", "apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq {p}"),
+                               ("dnf", "dnf", "dnf install -y -q {p}"),
+                               ("pacman", "pacman", "pacman -S --noconfirm --needed {p}")):
+        if shutil.which(manager):
+            shell = cmd.format(p=" ".join(info[kind]))
+            break
+    else:
+        raise RuntimeError(f"Install {info['label']} with your system's software center and try again.")
+    if os.geteuid() == 0:
+        full = ["sh", "-c", shell]
+    elif shutil.which("sudo") and subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
+        full = ["sudo", "-n", "sh", "-c", shell]
+    elif shutil.which("pkexec"):
+        full = ["pkexec", "sh", "-c", shell]
+    else:
+        raise RuntimeError(f"Install {info['label']} as administrator: sudo sh -c \"{shell}\"")
+    _say(progress, 20, f"Installing {info['label']} (enter your password if asked)…")
+    code, out = _run_install_cmd(full)
+    if code != 0:
+        raise RuntimeError(f"{info['label']} could not be installed ({code}):\n{out[-600:]}")
+
+
+def ensure_program(key: str, progress=None) -> str:
+    """Path of the program, installing it first when it is missing."""
+    info = PROGRAMS[key]
+    path = info["find"]()
+    if path:
+        return path
+    if os.environ.get("PDFMULE_NO_AUTOINSTALL"):
+        raise RuntimeError(f"{info['label']} is not installed.")
+    with _INSTALL_LOCK:
+        _refresh_found()
+        path = info["find"]()
+        if path:
+            return path
+        _say(progress, 3, f"{info['label']} is needed — installing it now (one time only)…")
+        if sys.platform == "win32":
+            _install_windows(key, progress)
+        elif sys.platform == "darwin":
+            _install_mac(key, progress)
+        else:
+            _install_linux(key, progress)
+        _refresh_found()
+        path = info["find"]()
+        if not path:
+            raise RuntimeError(f"{info['label']} was installed but could not be found. Restart PDF Mule and try again.")
+        _say(progress, 95, f"✓ {info['label']} installed")
+        return path
+
+
+def ensure_tessdata(codes, progress=None) -> None:
+    """Make sure these OCR languages (traineddata) are in PDF Mule's own tessdata folder, copying them
+    from the Tesseract installation or downloading them, and point Tesseract at that folder."""
+    codes = [c for c in dict.fromkeys(c.strip() for c in codes) if c and re.fullmatch(r"[A-Za-z0-9_]+", c)]
+    TESSDATA_DIR.mkdir(parents=True, exist_ok=True)
+    system_dir = _system_tessdata_dir()
+    for i, code in enumerate(codes):
+        target = TESSDATA_DIR / f"{code}.traineddata"
+        if target.exists() and target.stat().st_size > 1000:
+            continue
+        src = system_dir / f"{code}.traineddata" if system_dir else None
+        if src and src.exists():
+            shutil.copyfile(src, target)
+            continue
+        name = TESSERACT_LANGUAGE_NAMES.get(code, code) if "TESSERACT_LANGUAGE_NAMES" in globals() else code
+        _download(TESSDATA_URL.format(code=code), target, progress, f"Downloading OCR language {name}", 3, 6)
+    _ensure_tess_support(system_dir, progress)
+    os.environ["TESSDATA_PREFIX"] = str(TESSDATA_DIR)
+
+
+TESS_CONFIGS = {"pdf": "tessedit_create_pdf 1\n", "txt": "tessedit_create_txt 1\n",
+                "hocr": "tessedit_create_hocr 1\nhocr_font_info 0\n", "tsv": "tessedit_create_tsv 1\n",
+                "alto": "tessedit_create_alto 1\n", "quiet": "debug_file /dev/null\n"}
+PDF_TTF_URL = "https://raw.githubusercontent.com/tesseract-ocr/tesseract/main/tessdata/pdf.ttf"
+
+
+def _ensure_tess_support(system_dir, progress=None):
+    """Searchable-PDF output also needs tessdata/configs/pdf and tessdata/pdf.ttf next to the languages."""
+    cfg = TESSDATA_DIR / "configs"
+    cfg.mkdir(parents=True, exist_ok=True)
+    for name, text in TESS_CONFIGS.items():
+        src = system_dir / "configs" / name if system_dir else None
+        dst = cfg / name
+        if not dst.exists():
+            if src and src.exists():
+                shutil.copyfile(src, dst)
+            else:
+                dst.write_text(text, encoding="utf-8")
+    ttf = TESSDATA_DIR / "pdf.ttf"
+    if not ttf.exists():
+        src = system_dir / "pdf.ttf" if system_dir else None
+        if src and src.exists():
+            shutil.copyfile(src, ttf)
+        else:
+            _download(PDF_TTF_URL, ttf, progress, "Downloading OCR support file", 5, 6)
+
+
+@functools.lru_cache(maxsize=1)
+def _system_tessdata_dir() -> Optional[Path]:
+    tess = find_tesseract()
+    if not tess:
+        return None
+    try:
+        env = dict(os.environ); env.pop("TESSDATA_PREFIX", None)
+        cp = subprocess.run([tess, "--list-langs"], capture_output=True, text=True, errors="replace",
+                            timeout=15, env=env, **_no_window_kwargs())
+        m = re.search(r'languages in "?([^"\n]+?)"?\s*\(?\d*\)?:', (cp.stdout or "") + (cp.stderr or ""))
+        if m:
+            p = Path(m.group(1).strip())
+            return p if p.is_dir() else None
+    except Exception:
+        pass
+    return None
+
+
+if (TESSDATA_DIR / "eng.traineddata").exists():
+    os.environ.setdefault("TESSDATA_PREFIX", str(TESSDATA_DIR))
 
 
 def open_pdf(path: str, opts: Optional[dict] = None):
@@ -1277,6 +1652,11 @@ def eng_compress(progress, files, out, opts):
                 ghostscript("/ebook")
         elif profile.startswith("Strong"):
             pymupdf_images(110, 96, 55, "strong")
+            if not gs:
+                try:
+                    gs = ensure_program("ghostscript", progress)
+                except RuntimeError as exc:
+                    progress(55, f"⚠ Ghostscript unavailable ({exc}); using PyMuPDF only")
             ghostscript("/screen")
         elif profile.startswith("Smart"):
             doc = open_pdf(source, opts)
@@ -1345,6 +1725,12 @@ TESSERACT_LANGUAGE_NAMES = {
 
 
 def _tesseract_installed_languages(tess: str) -> set[str]:
+    """OCR languages PDF Mule can use: every language it knows (missing ones are downloaded when
+    needed), plus whatever the Tesseract installation lists."""
+    return set(TESSERACT_LANGUAGE_NAMES) | {"osd"} | _tesseract_listed_languages(tess)
+
+
+def _tesseract_listed_languages(tess: str) -> set[str]:
     """Return installed Tesseract traineddata language codes without importing heavy modules."""
     try:
         kwargs = {"capture_output": True, "text": True, "timeout": 8}
@@ -1513,16 +1899,22 @@ def _pix_to_pil(pix):
     return Image.frombytes(mode, (pix.width, pix.height), pix.samples)
 
 
-def _setup_tesseract():
+def _setup_tesseract(progress=None):
+    """pytesseract + the Tesseract program + English/Greek/orientation data, all installed when missing."""
     try:
         import pytesseract
     except Exception:
-        raise RuntimeError("OCR needs the pytesseract package. Install it from Dependency status.")
-    tess = find_tesseract()
-    if not tess:
-        raise RuntimeError("Tesseract OCR was not found. Install it and reopen PDF Mule — Windows: the "
-                           "UB-Mannheim installer (tick Greek); Mac: brew install tesseract tesseract-lang; "
-                           "Linux: sudo apt install tesseract-ocr tesseract-ocr-ell.")
+        if getattr(sys, "frozen", False):
+            raise RuntimeError("This build has no OCR module.")
+        _say(progress, 2, "Installing the OCR module (one time only)…")
+        ok, log = _pip_install(["pytesseract"])
+        importlib.invalidate_caches()
+        try:
+            import pytesseract
+        except Exception:
+            raise RuntimeError("The OCR module could not be installed:\n" + log[-500:])
+    tess = ensure_program("tesseract", progress)
+    ensure_tessdata(["eng", "osd", "ell"], progress)
     pytesseract.pytesseract.tesseract_cmd = tess
     return pytesseract, tess
 
@@ -1558,7 +1950,7 @@ def eng_ocr(progress, files, out, opts):
     page, so the output keeps the scan quality and roughly the input size (the
     old approach replaced every page by a re-encoded Tesseract image).
     """
-    pytesseract, tess = _setup_tesseract()
+    pytesseract, tess = _setup_tesseract(progress)
     installed = _tesseract_installed_languages(tess)
     mode = str(opts.get("ocr_mode", "Smart / Auto detect"))
     dpi = int(opts.get("dpi", 300))
@@ -1585,9 +1977,7 @@ def eng_ocr(progress, files, out, opts):
                                    ". Install the corresponding .traineddata files and try again.")
             lang = "+".join(requested)
             progress(6, "Manual OCR languages: " + ", ".join(TESSERACT_LANGUAGE_NAMES.get(x, x) for x in requested))
-        if auto_rotate and installed and "osd" not in installed:
-            auto_rotate = False
-            progress(7, "⚠ osd.traineddata not installed — automatic page straightening disabled")
+        ensure_tessdata(lang.split("+"), progress)   # downloads any language not yet on this computer
 
         n = len(src); done_ocr = skipped = rotated = 0
         for i in range(n):
@@ -1620,9 +2010,7 @@ def eng_ocr(progress, files, out, opts):
 
 
 def eng_office2pdf(progress, files, out, opts):
-    soffice = find_soffice()
-    if not soffice:
-        raise RuntimeError("LibreOffice was not found. Install LibreOffice and try again.")
+    soffice = ensure_program("libreoffice", progress)
     out_dir = Path(out); out_dir.mkdir(parents=True, exist_ok=True)
     made = []
     for i, f in enumerate(files):
@@ -1799,9 +2187,7 @@ def eng_pdf2xls(progress, files, out, opts):
 
 
 def eng_pdfa(progress, files, out, opts):
-    gs = find_ghostscript()
-    if not gs:
-        raise RuntimeError("PDF/A conversion needs Ghostscript. Install Ghostscript and ensure gs/gswin64c is on PATH.")
+    gs = ensure_program("ghostscript", progress)
     level = str(opts.get("pdfa", "2")).strip()[:1] or "2"
     tmp = out + ".part"
     cmd = [gs, f"-dPDFA={level}", "-dBATCH", "-dNOPAUSE", "-dQUIET", "-dNOOUTERSAVE", "-sDEVICE=pdfwrite",
@@ -2249,7 +2635,7 @@ def _translation_source_text(progress, pdf_path: str, opts: dict) -> tuple[str, 
         ocr_lang = ""
         if ocr_indexes:
             try:
-                pytesseract, tess = _setup_tesseract()
+                pytesseract, tess = _setup_tesseract(progress)
             except RuntimeError as exc:
                 raise RuntimeError(f"{len(ocr_indexes)} page(s) appear scanned. {exc} "
                                    "Or untick automatic OCR for scanned pages.")
@@ -2264,7 +2650,8 @@ def _translation_source_text(progress, pdf_path: str, opts: dict) -> tuple[str, 
                 ocr_lang, why = _smart_ocr_language(doc, pytesseract, installed, 0.70, progress)
                 if source_mode.startswith("Manual"):
                     why = "manual source has no matching installed OCR pack; " + why
-            can_rotate = not installed or "osd" in installed
+            ensure_tessdata(ocr_lang.split("+"), progress)
+            can_rotate = True
 
             progress(12, f"Scan fallback: {len(ocr_indexes)} page(s) • {why}")
             for n, page_index in enumerate(ocr_indexes, 1):
@@ -2493,6 +2880,17 @@ def eng_batch(progress, files, out, opts):
     if engine_key == "ocr":
         workers = min(workers, 2 if opts.get("performance_profile") != "Maximum speed" else workers)
 
+    # Programs the tool needs are installed once here, before parallel workers start.
+    if engine_key == "ocr":
+        _setup_tesseract(progress)
+    elif engine_key in ("word2pdf", "ppt2pdf", "xls2pdf"):
+        ensure_program("libreoffice", progress)
+    elif engine_key == "pdfa" or (engine_key == "compress" and str(opts.get("compression_profile", "")).startswith("Strong")):
+        try:
+            ensure_program("ghostscript", progress)
+        except RuntimeError:
+            if engine_key == "pdfa":
+                raise
     clean_opts = {k: v for k, v in opts.items() if not k.startswith("_")}
     jobs = [(engine_key, f, _batch_target(engine_key, f, str(root), i), clean_opts) for i, f in enumerate(files, 1)]
     successes, errors = [], []
@@ -4550,6 +4948,12 @@ class DependencyStatusDialog(QDialog):
         self.install_btn.setObjectName("primary")
         self.install_btn.clicked.connect(self.install_addons)
         buttons.addWidget(self.install_btn)
+        self.programs_btn = QPushButton("Install missing programs")
+        self.programs_btn.setToolTip("Tesseract OCR (with English, Greek and page orientation), Ghostscript and "
+                                     "LibreOffice. They are also installed by themselves the first time a tool needs them.")
+        self.programs_btn.clicked.connect(self.install_programs)
+        buttons.addWidget(self.programs_btn)
+        self.programs_worker = None
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_process)
@@ -4563,9 +4967,42 @@ class DependencyStatusDialog(QDialog):
         if getattr(sys, "frozen", False):
             self.install_btn.setEnabled(False)
             self.install_btn.setToolTip("This build already contains the Python add-ons.")
-            self.append_log("[INFO] Packaged build: the Python add-ons are built in. External programs (Tesseract, "
-                            "LibreOffice, Ghostscript) are detected and used when installed.")
+            self.append_log("[INFO] Packaged build: the Python add-ons are built in.")
+        self.append_log("[INFO] Tesseract OCR, Ghostscript and LibreOffice install by themselves the first time a "
+                        "tool needs them, or all at once with “Install missing programs”.")
         self.start_scan()
+
+    def install_programs(self):
+        if self.programs_worker and self.programs_worker.isRunning():
+            return
+        self.programs_btn.setEnabled(False); self.scan_btn.setEnabled(False)
+        self.progress.setRange(0, 100); self.progress.setValue(0)
+
+        def job(progress):
+            done = []
+            for key in ("tesseract", "ghostscript", "libreoffice"):
+                label = PROGRAMS[key]["label"]
+                if PROGRAMS[key]["find"]():
+                    progress(None, f"[OK] {label} is already installed"); continue
+                try:
+                    if key == "tesseract":
+                        _setup_tesseract(progress)
+                    else:
+                        ensure_program(key, progress)
+                    done.append(label); progress(None, f"[OK] {label} installed")
+                except RuntimeError as exc:
+                    progress(None, f"[ERROR] {label}: {exc}")
+            if PROGRAMS["tesseract"]["find"]():
+                ensure_tessdata(["eng", "osd", "ell"], progress)
+            return done
+
+        w = Worker(job); self.programs_worker = w
+        w.progress.connect(lambda v, m: (self.progress.setValue(v), self.status_label.setText(m), self.append_log(m)))
+        w.finished_ok.connect(lambda done: (self.append_log("[DONE] " + (", ".join(done) or "nothing new to install")),
+                                            self.programs_btn.setEnabled(True), self.start_scan()))
+        w.failed.connect(lambda e: (self.append_log("[ERROR] " + friendly_error(e)), self.programs_btn.setEnabled(True),
+                                    self.start_scan()))
+        w.start()
 
     def append_log(self, message):
         text = str(message).rstrip()
@@ -4723,10 +5160,21 @@ class DependencyStatusDialog(QDialog):
             if ans != QMessageBox.StandardButton.Yes:
                 event.ignore(); return
             self.proc.kill()
+        if self.programs_worker and self.programs_worker.isRunning():
+            QMessageBox.information(self, "Installing", "Programs are still being installed. "
+                                    "Wait for the installation to finish, then close this window.")
+            event.ignore(); return
         if self.scan_worker and self.scan_worker.isRunning():
             self.scan_worker.requestInterruption()
             self.scan_worker.wait(800)
         event.accept()
+
+    def reject(self):
+        if self.programs_worker and self.programs_worker.isRunning():
+            QMessageBox.information(self, "Installing", "Programs are still being installed. "
+                                    "Wait for the installation to finish, then close this window.")
+            return
+        super().reject()
 
 
 

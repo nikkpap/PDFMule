@@ -1,4 +1,4 @@
-# PDF Mule v1.6.0
+# PDF Mule v1.6.1
 
 A modern local-first PDF toolbox written in Python / PyQt6 and inspired by the category workflow of web PDF suites. PDF Mule is an independent project and is not affiliated with iLovePDF.
 
@@ -14,10 +14,10 @@ Get the newest version from **[Releases](https://github.com/nikkpap/PDFMule/rele
 | Linux | `PDFMule_v<version>-linux-x64` | Make it executable (`chmod +x`) and start it. |
 | Any system with Python 3.10+ | `PDFMule_v<version>.pyw` | Double-click; on the first start it installs what it needs by itself. |
 
-For OCR, Office → PDF and strong compression also install the free programs (PDF Mule finds them by itself):
-- **Windows:** [Tesseract](https://github.com/UB-Mannheim/tesseract/wiki) (tick Greek), [LibreOffice](https://www.libreoffice.org/), [Ghostscript](https://ghostscript.com/releases/gsdnld.html)
-- **Mac:** `brew install tesseract tesseract-lang ghostscript` and `brew install --cask libreoffice`
-- **Linux:** `sudo apt install tesseract-ocr tesseract-ocr-ell ghostscript libreoffice`
+OCR (Tesseract), PDF/A and strong compression (Ghostscript) and Office → PDF (LibreOffice) use free programs that
+PDF Mule **installs by itself** the first time a tool needs them — on Windows answer *Yes* at the permission
+prompt, on a Mac or Linux type your password when asked. *Help → Dependency status → Install missing programs*
+installs them all at once.
 
 ## Updates
 
