@@ -1,25 +1,45 @@
-# PDF Mule v1.5.0
+# PDF Mule v1.6.0
 
 A modern local-first PDF toolbox written in Python / PyQt6 and inspired by the category workflow of web PDF suites. PDF Mule is an independent project and is not affiliated with iLovePDF.
 
-## Run it
+## Download
 
-1. Install [Python 3.10+](https://www.python.org/downloads/) for Windows (tick "Add python.exe to PATH").
-2. Download `PDFMule.pyw` (plus `pdf_mule_logo.png` and `pdf_mule_icon.ico` for the logo/icon) and double-click it.
-   On the first start it installs everything it needs by itself, then opens.
-3. For OCR, Office → PDF and strong compression also install the free programs
-   [Tesseract](https://github.com/UB-Mannheim/tesseract/wiki) (tick Greek),
-   [LibreOffice](https://www.libreoffice.org/) and [Ghostscript](https://ghostscript.com/releases/gsdnld.html).
-   About → Dependency status shows what is found.
+Get the newest version from **[Releases](https://github.com/nikkpap/PDFMule/releases/latest)**:
+
+| System | File | How to start |
+|---|---|---|
+| Windows 10/11 | `PDFMule_v<version>-windows-x64.exe` | Double-click. If SmartScreen appears: *More info → Run anyway*. |
+| Mac, Apple silicon (M1–M4) | `PDFMule_v<version>-macos-arm64.zip` | Unzip, drag **PDF Mule** to *Applications*, then **right-click → Open** the first time. |
+| Mac, Intel | `PDFMule_v<version>-macos-x64.zip` | Same as above. |
+| Linux | `PDFMule_v<version>-linux-x64` | Make it executable (`chmod +x`) and start it. |
+| Any system with Python 3.10+ | `PDFMule_v<version>.pyw` | Double-click; on the first start it installs what it needs by itself. |
+
+For OCR, Office → PDF and strong compression also install the free programs (PDF Mule finds them by itself):
+- **Windows:** [Tesseract](https://github.com/UB-Mannheim/tesseract/wiki) (tick Greek), [LibreOffice](https://www.libreoffice.org/), [Ghostscript](https://ghostscript.com/releases/gsdnld.html)
+- **Mac:** `brew install tesseract tesseract-lang ghostscript` and `brew install --cask libreoffice`
+- **Linux:** `sudo apt install tesseract-ocr tesseract-ocr-ell ghostscript libreoffice`
 
 ## Updates
 
-PDF Mule checks this repository a few seconds after it starts. When a newer version is here it shows what
-changed and, with your OK, saves it next to your file as `PDFMule_v<version>.pyw` and opens it in place of the
-old window. About → **Check for updates** checks on demand; the switch next to it turns the start check off.
+Every PDF Mule (.exe, Mac app, Linux, .pyw) checks the latest release a few seconds after it starts. When there
+is a newer one it shows what changed and, with your OK, downloads it (with a progress bar), checks its SHA-256
+and opens the new version. About → **Check for updates** checks on demand; the switch next to it turns the
+start check off.
 
-Each release is published by committing the new `PDFMule.pyw` (with a higher `APP_VERSION`) and a
-`## v<version>` section at the top of `CHANGELOG.md` to `main`.
+## Making a release
+
+1. Raise `APP_VERSION` in `PDFMule.pyw`.
+2. Write what is new in `RELEASE_NOTES.md` (English and Greek part) and add it to `CHANGELOG.md`.
+3. Push to `main`. GitHub Actions tests the .pyw on Windows, Mac and Linux, builds all files, smoke-tests them
+   and publishes release `v<version>`. Pushing to any other branch runs the same builds without releasing
+   (the files are under the run's *Artifacts*).
+
+Optional signing secrets are described at the top of `.github/workflows/release.yml`.
+
+## v1.6 highlights
+
+- Windows .exe, Mac app (Apple silicon + Intel) and Linux releases, built and tested by GitHub Actions.
+- Every build updates itself from GitHub Releases, verified with SHA-256.
 
 ## v1.5 highlights
 

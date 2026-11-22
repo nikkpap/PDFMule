@@ -28,14 +28,27 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Any
 
 APP_NAME = "PDF Mule"
-APP_VERSION = "1.5.0"
-BUILD_DATE = "2026-10-30"
+APP_VERSION = "1.6.0"
+BUILD_DATE = "2026-11-22"
 APP_HOME = Path.home() / ".pdf_mule"
 SETTINGS_FILE = APP_HOME / "settings.json"
 try:
     APP_HOME.mkdir(parents=True, exist_ok=True)
 except OSError:
     pass  # settings simply won't persist; the app still works
+
+
+# Release check (tools/smoke.py): start, open the main window, write a report line, quit.
+SMOKE_FILE = os.environ.get("PDFMULE_SMOKE_TEST", "")
+
+
+def smoke(line: str):
+    if SMOKE_FILE:
+        try:
+            with open(SMOKE_FILE, "a", encoding="utf-8") as out:
+                out.write(line + "\n")
+        except OSError:
+            pass
 
 
 def app_base_dir() -> Path:
@@ -115,7 +128,17 @@ def _bootstrap_core():
     if not missing:
         return
     if getattr(sys, "frozen", False):
+        smoke("SETUP FAILED: missing in this build: " + ", ".join(missing))
         raise SystemExit("Missing core dependencies in this build: " + ", ".join(missing))
+    smoke("setup: installing " + ", ".join(missing))
+    if SMOKE_FILE:
+        ok, log = _pip_install(missing)
+        if not ok:
+            smoke("SETUP FAILED: " + log[-500:].replace("\n", " | "))
+            raise SystemExit(1)
+        smoke("setup done")
+        # Not execv: on Windows that ends this process at once and the test would see no result.
+        raise SystemExit(subprocess.run([sys.executable, *sys.argv]).returncode)
     result = {}
     try:
         import threading
@@ -177,7 +200,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox, QCheckBox, QProgressBar, QPlainTextEdit, QStackedWidget,
     QFormLayout, QDialogButtonBox, QInputDialog, QTableWidget, QTableWidgetItem,
     QHeaderView, QGroupBox, QRadioButton, QButtonGroup, QTextEdit, QListView, QSplitter,
-    QStackedLayout, QSizePolicy
+    QStackedLayout, QSizePolicy, QProgressDialog
 )
 
 # ----------------------------- Theme -----------------------------
@@ -546,9 +569,16 @@ def open_folder(path: str):
 
 
 def _windows_install_candidates() -> list[str]:
-    """Typical install locations for the optional external programs on Windows."""
+    """Typical install locations of the optional external programs. On a Mac an app started from
+    Finder does not get Homebrew's folders on PATH, so they are listed here too."""
+    if sys.platform == "darwin":
+        return ["/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract", "/opt/local/bin/tesseract",
+                "/opt/homebrew/bin/gs", "/usr/local/bin/gs", "/opt/local/bin/gs",
+                "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+                os.path.expanduser("~/Applications/LibreOffice.app/Contents/MacOS/soffice")]
     if os.name != "nt":
-        return []
+        return ["/usr/bin/tesseract", "/usr/local/bin/tesseract", "/usr/bin/gs", "/usr/bin/soffice",
+                "/usr/bin/libreoffice", "/snap/bin/libreoffice", "/opt/libreoffice/program/soffice"]
     roots = [os.environ.get("ProgramFiles", r"C:\Program Files"),
              os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
              os.environ.get("LOCALAPPDATA", "")]
@@ -1490,8 +1520,9 @@ def _setup_tesseract():
         raise RuntimeError("OCR needs the pytesseract package. Install it from Dependency status.")
     tess = find_tesseract()
     if not tess:
-        raise RuntimeError("Tesseract OCR was not found. Install Tesseract (Windows: UB-Mannheim build) "
-                           "and reopen PDF Mule.")
+        raise RuntimeError("Tesseract OCR was not found. Install it and reopen PDF Mule — Windows: the "
+                           "UB-Mannheim installer (tick Greek); Mac: brew install tesseract tesseract-lang; "
+                           "Linux: sudo apt install tesseract-ocr tesseract-ocr-ell.")
     pytesseract.pytesseract.tesseract_cmd = tess
     return pytesseract, tess
 
@@ -4531,9 +4562,9 @@ class DependencyStatusDialog(QDialog):
 
         if getattr(sys, "frozen", False):
             self.install_btn.setEnabled(False)
-            self.install_btn.setToolTip("This is a packaged EXE: Python add-ons must be bundled at build time (see BUILD_EXE.txt).")
-            self.append_log("[INFO] Packaged EXE build: pip installs are disabled. External programs (Tesseract, "
-                            "LibreOffice, Ghostscript) are still detected and used when installed.")
+            self.install_btn.setToolTip("This build already contains the Python add-ons.")
+            self.append_log("[INFO] Packaged build: the Python add-ons are built in. External programs (Tesseract, "
+                            "LibreOffice, Ghostscript) are detected and used when installed.")
         self.start_scan()
 
     def append_log(self, message):
@@ -4700,16 +4731,53 @@ class DependencyStatusDialog(QDialog):
 
 
 # ----------------------------------------------------------------------------------------------
-# App updates (OTA): the newest PDF Mule from GitHub, saved next to this one and started in its place
+# App updates (OTA) from GitHub Releases, for every way PDF Mule runs:
+#   PDFMule.pyw (script)  → the release's PDFMule_v<ver>.pyw, saved next to this one and started
+#   Windows .exe          → PDFMule_v<ver>-windows-x64.exe, saved next to this one and started
+#   Linux binary          → PDFMule_v<ver>-linux-x64, saved next to this one and started
+#   macOS "PDF Mule.app"  → PDFMule_v<ver>-macos-<arch>.zip, the .app bundle is replaced in place
+# Every download is checked against its SHA-256 before anything is changed.
 # ----------------------------------------------------------------------------------------------
-APP_PAGE = "https://github.com/nikkpap/PDFMule"
-APP_UPDATE_URL = "https://raw.githubusercontent.com/nikkpap/PDFMule/main/PDFMule.pyw"
-APP_CHANGES_URL = "https://raw.githubusercontent.com/nikkpap/PDFMule/main/CHANGELOG.md"
+import platform as _platform
+import hashlib as _hashlib
+
+WINDOWS = sys.platform == "win32"
+MAC = sys.platform == "darwin"
+LINUX = sys.platform.startswith("linux")
+FROZEN = bool(getattr(sys, "frozen", False))
+REPO = "nikkpap/PDFMule"
+APP_PAGE = f"https://github.com/{REPO}"
+RELEASES_API = f"https://api.github.com/repos/{REPO}/releases/latest"
+# Fallback for script users when no release exists yet (and for 1.5.x, which reads this file).
+APP_UPDATE_URL = f"https://raw.githubusercontent.com/{REPO}/main/PDFMule.pyw"
+UPDATE_HOSTS = ("github.com", "api.github.com", "raw.githubusercontent.com", "objects.githubusercontent.com",
+                "release-assets.githubusercontent.com", "github-releases.githubusercontent.com")
+
+
+def release_kind() -> str:
+    """The release file this copy updates from (the part after PDFMule_v<version>)."""
+    if not FROZEN:
+        return ".pyw"
+    if WINDOWS:
+        return "-windows-x64.exe"
+    if MAC:
+        arm = _platform.machine().lower() in ("arm64", "aarch64")
+        return "-macos-arm64.zip" if arm else "-macos-x64.zip"
+    return "-linux-x64"
 
 
 def script_dir() -> Path:
     """Folder of the running .pyw (new versions are saved next to it)."""
     return Path(os.path.abspath(sys.argv[0] if sys.argv and sys.argv[0] else __file__)).resolve().parent
+
+
+def app_path() -> Path:
+    """What an update replaces or sits next to: the .app bundle, the .exe / binary, or the .pyw."""
+    if FROZEN and MAC:
+        return Path(sys.executable).resolve().parents[2]   # …/PDF Mule.app/Contents/MacOS/<exe>
+    if FROZEN:
+        return Path(sys.executable).resolve()
+    return Path(os.path.abspath(sys.argv[0] if sys.argv and sys.argv[0] else __file__)).resolve()
 
 
 def _gui_python() -> str:
@@ -4722,97 +4790,299 @@ def _gui_python() -> str:
     return str(exe)
 
 
+def _tls_context():
+    """python.org Python on macOS (and frozen apps) may ship without CA certificates: use certifi's."""
+    import ssl
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(cafile=certifi.where())
+    except Exception:
+        pass
+    return ctx
+
+
+def _http_get(url: str, limit: int, accept: str = "application/octet-stream", progress=None, timeout=30) -> bytes:
+    import urllib.parse
+    import urllib.request
+    u = urllib.parse.urlsplit(url)
+    if u.scheme != "https" or u.hostname not in UPDATE_HOSTS:
+        raise ValueError("Updates must come from GitHub over HTTPS.")
+    req = urllib.request.Request(url, headers={"User-Agent": f"PDFMule/{APP_VERSION}", "Accept": accept,
+                                               "Cache-Control": "no-cache"})
+    with urllib.request.urlopen(req, timeout=timeout, context=_tls_context()) as r:
+        final = urllib.parse.urlsplit(r.url)
+        if final.scheme != "https" or final.hostname not in UPDATE_HOSTS:
+            raise ValueError("The download was redirected away from GitHub.")
+        total = int(r.headers.get("Content-Length") or 0)
+        chunks, got, shown = [], 0, -1
+        while True:
+            chunk = r.read(256 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk); got += len(chunk)
+            if got > limit:
+                raise ValueError("The update file is unexpectedly large.")
+            if progress and total:
+                pct = got * 100 // total
+                if pct != shown:
+                    shown = pct
+                    progress(min(99, pct), f"Downloading… {got / 1e6:.1f} of {total / 1e6:.1f} MB")
+    return b"".join(chunks)
+
+
 def _http(url, timeout=15):
+    """Kept for callers of the 1.5 API."""
     import urllib.request
     req = urllib.request.Request(url, headers={"User-Agent": f"PDFMule/{APP_VERSION}", "Cache-Control": "no-cache"})
-    return urllib.request.urlopen(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout, context=_tls_context())
 
 
 def _ver(v) -> tuple:
+    nums = [int(n) for n in re.findall(r"\d+", str(v))[:3]]
+    return tuple(nums + [0] * (3 - len(nums))) if nums else (0, 0, 0)
+
+
+def _plain_notes(md: str, limit: int = 1400) -> str:
+    """Release notes for a message box: no Markdown symbols, at most `limit` characters."""
+    out = []
+    for line in (md or "").splitlines():
+        s = line.rstrip()
+        s = re.sub(r"^#{1,6}\s*", "", s)
+        s = re.sub(r"^\s*[-*]\s+", "• ", s)
+        s = s.replace("**", "").replace("__", "").replace("`", "")
+        s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+        out.append(s)
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+    return text if len(text) <= limit else text[:limit].rsplit("\n", 1)[0] + "\n…"
+
+
+def _notes_for_language(md: str) -> str:
+    """RELEASE_NOTES have an English and a Greek part: show the part matching the system language."""
+    parts = re.split(r"^###\s+", md or "", flags=re.M)
+    if len(parts) < 3:
+        return md
+    want_greek = False
     try:
-        return tuple(int(x) for x in str(v).strip().lstrip("vV").split("."))
-    except ValueError:
-        return (0,)
+        from PyQt6.QtCore import QLocale
+        want_greek = QLocale.system().name().lower().startswith("el")
+    except Exception:
+        pass
+    for p in parts[1:]:
+        head = p.split("\n", 1)[0].lower()
+        if (want_greek and ("ελλην" in head or "greek" in head)) or (not want_greek and "english" in head):
+            return parts[0] + "### " + p
+    return md
 
 
 def app_update_check(progress=None):
-    """(version, text, notes) of a newer PDF Mule on GitHub, or None when this one is the newest."""
+    """Newest release for this platform: dict(version, notes, page, asset_url, sha256, name) or None."""
     import urllib.error
     try:
-        with _http(APP_UPDATE_URL, timeout=25) as r:
-            text = r.read().decode("utf-8")
+        data = json.loads(_http_get(RELEASES_API, 2_000_000, "application/vnd.github+json", timeout=20))
     except urllib.error.HTTPError as e:
-        if e.code == 404:
-            raise RuntimeError("the update file was not found on GitHub (404). The repository must be public "
-                               f"for updates to work: {APP_PAGE}")
+        if e.code == 404 and not FROZEN:
+            return _raw_main_check()   # no release published yet: the script on main
+        if e.code == 403:
+            raise RuntimeError("GitHub refused the check for now (rate limit). Try again in an hour.")
         raise RuntimeError(f"GitHub answered HTTP {e.code}")
     except urllib.error.URLError as e:
         raise RuntimeError(f"no connection to GitHub ({e.reason})")
-    m = re.search(r'^APP_VERSION = "([0-9.]+)"', text, re.M)
-    if not m:
-        raise RuntimeError("the file on GitHub has no version")
-    ver = m.group(1)
+    ver = data.get("tag_name") or data.get("name") or "0"
     if _ver(ver) <= _ver(APP_VERSION):
         return None
-    compile(text, f"PDFMule_v{ver}.pyw", "exec")   # a download cut short is never started
-    notes = ""
+    kind = release_kind().lower()
+    assets = {a.get("name", "").lower(): a for a in (data.get("assets") or [])}
+    pick = None
+    for name, a in assets.items():
+        if name.startswith("pdfmule_v") and name.endswith(kind) and not name.endswith(".sha256"):
+            pick = a; break
+    if pick is None and kind == ".pyw":
+        pick = assets.get("pdfmule.pyw")
+    if pick is None:
+        if not FROZEN:
+            return _raw_main_check()
+        raise RuntimeError(f"Release {ver} has no file for this system yet ({kind.strip('-')}). "
+                           f"It can be downloaded later from {APP_PAGE}/releases")
+    sha = None
+    if str(pick.get("digest", "")).startswith("sha256:"):
+        sha = pick["digest"].split(":", 1)[1].lower()
+    elif assets.get(pick["name"].lower() + ".sha256"):
+        try:
+            t = _http_get(assets[pick["name"].lower() + ".sha256"]["browser_download_url"], 4096).decode("utf-8", "replace")
+            sha = (t.split() or [None])[0]
+        except Exception:
+            sha = None
+    return {"version": ver.lstrip("vV"), "notes": _plain_notes(_notes_for_language(data.get("body") or "")),
+            "page": data.get("html_url") or f"{APP_PAGE}/releases", "asset_url": pick["browser_download_url"],
+            "sha256": sha, "name": pick["name"], "size": int(pick.get("size") or 0)}
+
+
+def _raw_main_check():
+    text = _http_get(APP_UPDATE_URL, 16 * 1024 * 1024).decode("utf-8")
+    m = re.search(r'^APP_VERSION = "([0-9.]+)"', text, re.M)
+    if not m or _ver(m.group(1)) <= _ver(APP_VERSION):
+        return None
+    ver = m.group(1)
+    return {"version": ver, "notes": "", "page": APP_PAGE, "asset_url": APP_UPDATE_URL, "sha256": None,
+            "name": f"PDFMule_v{ver}.pyw", "size": len(text.encode("utf-8")), "payload": text.encode("utf-8")}
+
+
+UPDATE_NO_PERMISSION = ("The app's folder can't be written to. Move PDF Mule to a folder you own "
+                        "(or Applications on a Mac) and update again.")
+UPDATE_TRANSLOCATED = ("macOS is running PDF Mule from a temporary read-only copy. Drag “PDF Mule” into "
+                       "Applications, open it from there, then update again.")
+
+
+def _install_mac_bundle(payload: bytes) -> Path:
+    target = app_path()
+    if "/AppTranslocation/" in str(target):
+        raise ValueError(UPDATE_TRANSLOCATED)
+    if not os.access(target.parent, os.W_OK):
+        raise ValueError(UPDATE_NO_PERMISSION)
+    with tempfile.TemporaryDirectory(prefix="PDFMule-update-") as folder:
+        archive = Path(folder) / "update.zip"
+        archive.write_bytes(payload)
+        unpacked = Path(folder) / "app"
+        subprocess.run(["/usr/bin/ditto", "-x", "-k", str(archive), str(unpacked)], check=True, timeout=300)
+        new = next(unpacked.glob("*.app"), None)
+        if new is None:
+            raise ValueError("The downloaded update has no .app inside. Nothing was changed.")
+        old = target.with_name(target.name + ".old")
+        shutil.rmtree(old, ignore_errors=True)
+        target.rename(old)
+        try:
+            shutil.move(str(new), str(target))
+        except OSError:
+            old.rename(target)
+            raise
+    return target
+
+
+def app_update_install(info: dict, progress=None) -> Path:
+    """Download, verify and put the new version in place. Returns what to start."""
+    limit = 600 * 1024 * 1024 if FROZEN else 16 * 1024 * 1024
+    payload = info.get("payload") or _http_get(info["asset_url"], limit, progress=progress, timeout=60)
+    if progress:
+        progress(99, "Checking the download…")
+    if info.get("sha256") and _hashlib.sha256(payload).hexdigest().lower() != info["sha256"].lower():
+        raise ValueError("The downloaded update failed its checksum. Nothing was changed.")
+    ver = info["version"]
+    if not FROZEN:
+        compile(payload, f"PDFMule_v{ver}.pyw", "exec")   # a download cut short is never started
+        if b"APP_NAME" not in payload:
+            raise ValueError("The downloaded file is not PDF Mule. Nothing was changed.")
+        dest = script_dir() / f"PDFMule_v{ver}.pyw"
+    else:
+        magic = b"MZ" if WINDOWS else b"PK" if MAC else b"\x7fELF"
+        if not payload.startswith(magic):
+            raise ValueError("The downloaded file is not a program for this system. Nothing was changed.")
+        if MAC:
+            return _install_mac_bundle(payload)
+        dest = app_path().parent / f"PDFMule_v{ver}{release_kind()}"
+    if not os.access(dest.parent, os.W_OK):
+        raise ValueError(UPDATE_NO_PERMISSION)
+    tmp = dest.with_name(dest.name + ".part")
     try:
-        with _http(APP_CHANGES_URL, timeout=10) as r:
-            ch = r.read().decode("utf-8")
-        parts = re.split(r"^## ", ch, flags=re.M)
-        news = [x for x in parts[1:] if x.split() and _ver(x.split()[0]) > _ver(APP_VERSION)]
-        # Only the heading and the bullet lines, kept short for the dialog.
-        out = []
-        for x in news[:4]:
-            lines = [l.strip() for l in x.strip().splitlines()]
-            head = lines[0]
-            bullets = [l for l in lines[1:] if l.startswith("- ")][:6]
-            out.append(head + "\n" + "\n".join(bullets))
-        notes = "\n\n".join(out)
-    except Exception:
-        pass
-    return ver, text, notes
-
-
-def app_update_install(ver: str, text: str) -> Path:
-    """Saves PDFMule_v<ver>.pyw next to this file and starts it; the newer copy makes this one close."""
-    dest = script_dir() / f"PDFMule_v{ver}.pyw"
-    tmp = dest.with_suffix(".pyw.part")
-    tmp.write_text(text, encoding="utf-8", newline="\n")
-    os.replace(tmp, dest)
-    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    subprocess.Popen([_gui_python(), str(dest)], cwd=str(dest.parent), close_fds=True,
-                     creationflags=flags if os.name == "nt" else 0)
+        tmp.write_bytes(payload)
+        os.replace(tmp, dest)
+    except PermissionError:
+        tmp.unlink(missing_ok=True)
+        raise ValueError(UPDATE_NO_PERMISSION)
+    if not WINDOWS:
+        dest.chmod(0o755)
     return dest
 
 
-def offer_app_update(parent, res, quiet=False):
-    """Asks to update when res names a newer version; with quiet, says nothing when there is none."""
-    if not res:
+def start_new_version(path: Path):
+    """Start the new copy; it takes over from this one (see single_instance)."""
+    if MAC and FROZEN:
+        subprocess.Popen(["/usr/bin/open", "-n", str(path)])
+        return
+    cmd = [str(path)] if FROZEN else [_gui_python(), str(path)]
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen(cmd, cwd=str(path.parent), close_fds=True, creationflags=flags if WINDOWS else 0)
+
+
+def clean_old_versions():
+    """After an update: remove what the previous version left behind. Old .pyw files are kept (they are
+    small and let you go back); old .exe / Linux binaries are removed (they are large); a Mac's
+    “PDF Mule.app.old” is removed."""
+    try:
+        me = app_path()
+        old = me.with_name(me.name + ".old")
+        if old.is_dir():
+            shutil.rmtree(old, ignore_errors=True)
+        elif old.exists():
+            old.unlink(missing_ok=True)
+        if FROZEN and not MAC:
+            kind = release_kind()
+            for f in me.parent.glob(f"PDFMule_v*{kind}"):
+                if f.resolve() == me:
+                    continue
+                m = re.match(r"PDFMule_v([\d.]+)", f.name)
+                if m and _ver(m.group(1)) < _ver(APP_VERSION):
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass   # still closing; tried again at the next start
+            for part in me.parent.glob("PDFMule_v*.part"):
+                part.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def offer_app_update(parent, info, quiet=False):
+    """Asks to update when info names a newer version; with quiet, says nothing when there is none."""
+    if not info:
         if not quiet:
             QMessageBox.information(parent, "No update", f"{APP_NAME} {APP_VERSION} is the newest version.")
         return
-    ver, text, notes = res
-    esc = lambda t: t.replace("&", "&amp;").replace("<", "&lt;").replace("\n", "<br>")
+    ver = info["version"]
     box = QMessageBox(parent)
     box.setWindowTitle(f"Update {APP_NAME}?")
     box.setIcon(QMessageBox.Icon.Information)
-    box.setTextFormat(Qt.TextFormat.RichText)
-    box.setText(f"<b>{APP_NAME} {ver}</b> is out (you have {APP_VERSION}).<br><br>"
-                + (f"<small>{esc(notes)}</small><br><br>" if notes else "")
-                + f"Update now? It is saved next to this file as <b>PDFMule_v{ver}.pyw</b> and opens in place of "
-                  "this window. Your settings and recent outputs stay; the old file stays too, in case you want it back.")
+    size = f" ({info['size'] / 1e6:.0f} MB)" if info.get("size", 0) > 2e6 else ""
+    where = ("It replaces this app; your settings and recent outputs stay." if (FROZEN and MAC) else
+             f"It is saved next to this one as {info['name']} and opens in place of this window; "
+             "your settings and recent outputs stay.")
+    box.setText(f"{APP_NAME} {ver} is out (you have {APP_VERSION}).\n\nUpdate now{size}? {where}")
+    if info.get("notes"):
+        box.setInformativeText("What's new:\n\n" + info["notes"])
     go = box.addButton("Update now", QMessageBox.ButtonRole.AcceptRole)
+    page = box.addButton("Release page", QMessageBox.ButtonRole.HelpRole)
     box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
     box.exec()
+    if box.clickedButton() is page:
+        QDesktopServices.openUrl(QUrl(info["page"])); return
     if box.clickedButton() is not go:
         return
-    try:
-        app_update_install(ver, text)
-    except Exception as e:
-        QMessageBox.critical(parent, "Update failed", f"Could not save the new version: {e}")
-        return
-    QTimer.singleShot(10000, QApplication.quit)   # in case the new copy cannot ask this one to close
+    dlg = QProgressDialog(f"Downloading {APP_NAME} {ver}…", "Cancel", 0, 100, parent)
+    dlg.setWindowTitle(f"Updating {APP_NAME}"); dlg.setMinimumDuration(0); dlg.setAutoClose(False); dlg.setValue(0)
+    w = Worker(lambda progress: app_update_install(info, progress))
+    parent._install_worker = w
+    w.progress.connect(lambda v, m: (dlg.setValue(v), dlg.setLabelText(m) if m else None))
+    dlg.canceled.connect(w.requestInterruption)
+
+    def ok(path):
+        dlg.setValue(100); dlg.close()
+        try:
+            start_new_version(Path(path))
+        except Exception as e:
+            QMessageBox.critical(parent, "Update", f"{APP_NAME} {ver} was installed but could not be started: {e}\n\n"
+                                                    f"Start it yourself: {path}")
+            return
+        QTimer.singleShot(8000, QApplication.quit)   # in case the new copy cannot ask this one to close
+
+    def fail(err):
+        dlg.close()
+        msg = friendly_error(err)
+        if QMessageBox.question(parent, "Update failed", f"{msg}\n\nOpen the release page to download it yourself?") \
+                == QMessageBox.StandardButton.Yes:
+            QDesktopServices.openUrl(QUrl(info["page"]))
+
+    w.finished_ok.connect(ok); w.failed.connect(fail); w.cancelled.connect(dlg.close)
+    w.start()
 
 
 def auto_install_addons(win):
@@ -4834,21 +5104,17 @@ def auto_install_addons(win):
 
 
 def ota_supported() -> bool:
-    """A packaged EXE cannot replace itself with a .pyw; it points to the GitHub page instead."""
-    return not getattr(sys, "frozen", False)
+    """Every build updates itself now: script, Windows .exe, Linux binary and the macOS app."""
+    return True
 
 
 def run_update_check(parent, quiet: bool):
     """Background check (never blocks the window); the result is shown on the GUI thread."""
-    if not ota_supported():
-        if not quiet:
-            QMessageBox.information(parent, "Updates", f"This is a packaged EXE. Download new versions from\n{APP_PAGE}")
-        return
     w = Worker(app_update_check)
     parent._update_worker = w   # keep a reference while it runs
     w.finished_ok.connect(lambda r: offer_app_update(parent, r, quiet))
     if not quiet:
-        w.failed.connect(lambda e: QMessageBox.warning(parent, "Updates", "Could not reach GitHub:\n" + friendly_error(e)))
+        w.failed.connect(lambda e: QMessageBox.warning(parent, "Updates", "Could not check for updates:\n" + friendly_error(e)))
     w.start()
 
 
@@ -5360,10 +5626,25 @@ def main():
     app.setWindowIcon(load_app_icon())
     app.setStyle("Fusion")
 
+    if SMOKE_FILE:
+        smoke(f"start v{APP_VERSION} on {sys.platform} {_platform.machine()} (frozen={FROZEN})")
+        w = MainWindow(); w.show()
+        def report():
+            ok = w.isVisible() and len(TOOLS) > 0
+            try:
+                d = fitz.open(); d.new_page(); d.tobytes(); d.close()   # PyMuPDF works in this build
+            except Exception as exc:
+                smoke(f"ERROR PyMuPDF: {exc}"); ok = False
+            smoke("OK window started" if ok else "ERROR window did not open")
+            app.quit()
+        QTimer.singleShot(1500, report)
+        sys.exit(app.exec())
+
     # One running copy: a newer version takes over from an older one (OTA), a second
     # start of the same version just brings the open window to the front.
     if not single_instance():
         sys.exit(0)
+    clean_old_versions()
 
     # Channelizer-style fake startup presentation: logo, staged status,
     # version/build metadata and ~3-second progress before the main UI appears.

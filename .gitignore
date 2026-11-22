@@ -6,3 +6,4 @@ dist/
 *.spec
 pdfs-test/
 PDFMule_v*.pyw
+win_version.txt

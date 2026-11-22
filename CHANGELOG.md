@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.6.0 — Windows, Mac and Linux releases with self-update
+
+- GitHub Actions builds and publishes each version as a release: Windows .exe (optionally code-signed), macOS app for Apple silicon and Intel (ad-hoc signed, or Developer ID + notarized when the secrets are set), Linux binary, and the .pyw. Every build is smoke-tested before release.
+- OTA for every build: the app reads the latest GitHub release, picks the file for its own system, downloads it with a progress bar (cancellable), verifies SHA-256 and restarts into the new version. Windows/Linux: saved as PDFMule_v<version>-… next to the old one, which is removed at the next start. Mac: the .app bundle is replaced in place. Script: PDFMule_v<version>.pyw next to the old one.
+- Release notes shown in the user's language (English/Greek) as plain text, without Markdown symbols.
+- macOS/Linux: Tesseract, Ghostscript and LibreOffice found in Homebrew / Applications / usual folders.
+- Packaged builds include OCR, Word, Excel, PowerPoint, Markdown and translation add-ons.
+- Smoke-test mode (PDFMULE_SMOKE_TEST) used by the release checks.
+
 ## v1.5.0 — updates over the internet (OTA), automatic setup
 
 - **Updates (OTA)**: a few seconds after start (in the background) and with About → Check for updates, PDF Mule looks for a newer `PDFMule.pyw` on GitHub, shows what is new and, with your OK, saves it next to the current file as `PDFMule_v<version>.pyw` and opens it in place of this window. Settings and recent outputs stay; the old file stays too. A switch in About turns the start check off.

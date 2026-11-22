@@ -1,25 +1,25 @@
-PDF Mule v1.5.0 - example Windows PyInstaller build
-=================================================
+PDF Mule - building the apps
+============================
 
-1. Install core + PyInstaller:
-   py -m pip install --upgrade PyQt6 PyMuPDF Pillow pyinstaller
+Releases are built automatically by GitHub Actions (.github/workflows/release.yml):
+raise APP_VERSION in PDFMule.pyw, update RELEASE_NOTES.md, push to main.
 
-2. Optional integrations:
-   py -m pip install --upgrade pytesseract pdf2docx python-pptx openpyxl weasyprint pymupdf4llm deep-translator
+To build by hand on Windows (same options as the workflow):
 
-3. Build:
-   py -m PyInstaller --noconfirm --clean --onefile --windowed ^
-      --name PDFMule_v1.5.0 ^
-      --manifest PDFMule_v1.5.0.manifest ^
-      --icon pdf_mule_icon.ico ^
-      --add-data "pdf_mule_logo.png;." ^
-      --add-data "pdf_mule_icon.ico;." ^
-      PDFMule.pyw
+  py -m pip install --upgrade pyinstaller pillow certifi PyQt6 PyMuPDF pytesseract openpyxl python-pptx pdf2docx deep-translator "pymupdf4llm<1"
+  py tools\build_info.py
+  py -m PyInstaller --noconfirm --onefile --windowed --name PDFMule_v<version>-windows-x64 ^
+     --icon pdf_mule_icon.ico --manifest PDFMule.manifest --version-file win_version.txt ^
+     --add-data "pdf_mule_logo.png;." --add-data "pdf_mule_icon.png;." --add-data "pdf_mule_icon.ico;." ^
+     --exclude-module tkinter --exclude-module weasyprint --exclude-module onnxruntime ^
+     PDFMule.pyw
+
+Mac (in Terminal): the same packages, then
+  pyinstaller --noconfirm --windowed --onedir --name "PDF Mule" --osx-bundle-identifier gr.nikkpap.pdfmule \
+     --icon pdf_mule_icon.png --add-data "pdf_mule_logo.png:." --add-data "pdf_mule_icon.png:." PDFMule.pyw
 
 Notes:
-- Tesseract, LibreOffice and Ghostscript are external programs and are not bundled automatically by the command above.
-- For multiprocessing in a frozen executable PDF Mule calls multiprocessing.freeze_support().
-- If an optional Python package uses extra data files, add the corresponding PyInstaller collect-data/collect-all option as required by that package/version.
-- In a packaged EXE the Dependency status window detects add-ons but cannot pip-install them (pip would
-  re-launch the EXE). Install every optional Python package you want BEFORE running PyInstaller.
-- Settings and small UI assets live in %USERPROFILE%\.pdf_mule\
+- Tesseract, LibreOffice and Ghostscript are separate programs; PDF Mule finds them when installed.
+- HTML to PDF (WeasyPrint) needs the GTK runtime and is only available in the .pyw.
+- pymupdf4llm < 1 avoids the ~100 MB layout model that 2.x pulls in.
+- Settings live in ~/.pdf_mule/ (Windows: %USERPROFILE%\.pdf_mule\).
