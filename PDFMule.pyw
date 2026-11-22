@@ -788,8 +788,19 @@ def _install_windows(key: str, progress) -> None:
         if signer and not _win_signature_ok(exe, signer):
             raise RuntimeError(f"The {info['label']} download failed its signature check. Nothing was installed.")
         _say(progress, 65, f"Installing {info['label']} (answer Yes at the Windows prompt)…")
-        code = _win_run_elevated(str(exe), args, timeout=900)
+        try:
+            code = _win_run_elevated(str(exe), args, timeout=300)
+        except RuntimeError:
+            # Some installers (Ghostscript) finish copying but keep running afterwards: if the program
+            # is in place, that counts as installed.
+            _refresh_found()
+            if info["find"]():
+                return
+            raise
         if code != 0:
+            _refresh_found()
+            if info["find"]():
+                return
             raise RuntimeError(f"The {info['label']} installer stopped with code {code}.")
 
 

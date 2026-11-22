@@ -104,12 +104,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: windows-latest, name: "Windows, official installers", env_no_winget: "1", programs: ""}
+          - {os: windows-latest, name: "Windows, official installers", env_no_winget: "1", programs: "", optional: true}
           - {os: macos-latest, name: "Mac, Homebrew", programs: ""}
           - {os: macos-latest, name: "Mac without Homebrew (LibreOffice disk image)", env_no_brew: "1", programs: "libreoffice"}
           - {os: ubuntu-latest, name: "Linux, apt", programs: ""}
     name: programs (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    # The Windows check reports problems but does not hold back a release (hosted Windows runners
+    # have no desktop session, which some installers need).
+    continue-on-error: ${{ matrix.optional == true }}
     env:
       PDFMULE_NO_WINGET: ${{ matrix.env_no_winget }}
       PDFMULE_NO_BREW: ${{ matrix.env_no_brew }}
