@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.7.0-rc1 — release candidate: review, fixes and easier tools
+
+Includes everything below from 1.6.1 (never released on its own), plus:
+
+- **Fix — PDF to Word stopped with "pixmap must be grayscale or rgb to write as png"** on PDFs with CMYK/ICC, Separation or DeviceN pictures (typical for printed books). Such pictures are now converted to RGB on the fly.
+- PDF to Word: progress per page, an optional page range for big books, auto-install of the converter in the .pyw.
+- Fix — the Windows installers could hang forever (PowerShell `Start-Process -Wait` waited for processes the Ghostscript installer leaves running); installers now have a time limit and report their exit code.
+- HTML to PDF prints with Microsoft Edge / Google Chrome (no GTK needed); a domain typed without https:// works; local files fall back to LibreOffice.
+- iPhone photos (HEIC/HEIF), WebP and GIF in Images → PDF; ODT/RTF/TXT, ODP/PPS, ODS/CSV in the Office → PDF tools.
+- Errors in plain words (file open in another program, disk full, damaged PDF, no Internet …) with the technical details behind "Show Details" and in ~/.pdf_mule/logs/errors.log.
+- Tool windows guide you in steps (1 add files · 2 options · 3 run), show file name · size · folder instead of long paths, and the order of files can be changed by dragging.
+- A background update check waits until no tool is working before it asks.
+- Release candidates: versions like 1.7.0-rc1 are published as pre-releases. People on a release candidate (or who tick "Also offer test versions" in About) get the next candidate and the final version; everyone else only gets final versions.
+
 ## v1.6.1 — automatic install of Tesseract, Ghostscript and LibreOffice
 
 - Tesseract OCR, Ghostscript and LibreOffice are installed automatically the first time a tool needs them (Windows: winget or the official signed installers with one UAC prompt; Mac: Homebrew, or Terminal installs Homebrew; LibreOffice also from the official disk image; Linux: apt/dnf/pacman with sudo/pkexec).

@@ -1,4 +1,4 @@
-# PDF Mule v1.6.1
+# PDF Mule v1.7.0-rc1
 
 A modern local-first PDF toolbox written in Python / PyQt6 and inspired by the category workflow of web PDF suites. PDF Mule is an independent project and is not affiliated with iLovePDF.
 
@@ -25,6 +25,12 @@ Every PDF Mule (.exe, Mac app, Linux, .pyw) checks the latest release a few seco
 is a newer one it shows what changed and, with your OK, downloads it (with a progress bar), checks its SHA-256
 and opens the new version. About → **Check for updates** checks on demand; the switch next to it turns the
 start check off.
+
+## Release candidates
+
+A version with a suffix (`1.7.0-rc1`) is published as a GitHub **pre-release**. Only people running a release
+candidate, or who ticked *About → Also offer test versions*, are offered it; everyone else keeps getting final
+versions only. Raise `APP_VERSION` to the plain number (`1.7.0`) for the final release.
 
 ## Making a release
 

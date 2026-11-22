@@ -5,8 +5,8 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 src = (root / "PDFMule.pyw").read_text(encoding="utf-8")
-ver = re.search(r'^APP_VERSION = "([0-9.]+)"', src, re.M).group(1)
-nums = (ver.split(".") + ["0", "0", "0"])[:4]
+ver = re.search(r'^APP_VERSION = "([0-9][0-9A-Za-z.\-]*)"', src, re.M).group(1)
+nums = (re.findall(r"\d+", ver.split("-")[0]) + ["0", "0", "0", "0"])[:4]
 t = ", ".join(nums)
 dotted = ".".join(nums)
 (root / "win_version.txt").write_text(f"""VSVersionInfo(

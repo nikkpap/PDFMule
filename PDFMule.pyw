@@ -17,6 +17,7 @@ import tempfile
 import time
 import traceback
 import difflib
+import logging
 import multiprocessing
 import importlib.util
 import functools
@@ -28,7 +29,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Any
 
 APP_NAME = "PDF Mule"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.7.0-rc1"
 BUILD_DATE = "2026-11-22"
 APP_HOME = Path.home() / ".pdf_mule"
 SETTINGS_FILE = APP_HOME / "settings.json"
@@ -379,20 +380,20 @@ TOOLS = [
     ToolDef("remove", "Remove pages", "Organize PDF", "🗑", "Delete the same selected pages from one or many PDFs.", True, batchable=True),
     ToolDef("extract", "Extract pages", "Organize PDF", "📤", "Extract the same page selection from one or many PDFs.", True, batchable=True),
     ToolDef("organize", "Organize PDF", "Organize PDF", "↕", "Visual thumbnails: reorder, rotate, delete and preview pages."),
-    ToolDef("scan", "Scan / Images to PDF", "Organize PDF", "📷", "Build one PDF from scans or image files.", True, "Images (*.jpg *.jpeg *.png *.bmp *.tif *.tiff)"),
+    ToolDef("scan", "Scan / Photos to PDF", "Organize PDF", "📷", "One PDF from scanned images or phone photos (iPhone HEIC too), straightened automatically.", True, "Images (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp *.gif *.heic *.heif)"),
 
     ToolDef("compress", "Compress PDF", "Optimize PDF", "🗜", "Batch optimize and recompress PDF objects with smart background processing.", True, batchable=True),
     ToolDef("repair", "Repair PDF", "Optimize PDF", "🛠", "Batch rewrite PDFs into clean files and rebuild object tables.", True, batchable=True),
     ToolDef("ocr", "OCR PDF", "Optimize PDF", "🔎", "Batch OCR scanned PDFs with Tesseract while the UI remains responsive.", True, batchable=True),
 
-    ToolDef("img2pdf", "JPG / Image to PDF", "Convert to PDF", "🖼", "Convert one or more images into one PDF.", True, "Images (*.jpg *.jpeg *.png *.bmp *.tif *.tiff)"),
-    ToolDef("word2pdf", "Word to PDF", "Convert to PDF", "W", "Batch convert DOC/DOCX using LibreOffice.", True, "Word files (*.doc *.docx)", True),
-    ToolDef("ppt2pdf", "PowerPoint to PDF", "Convert to PDF", "P", "Batch convert PPT/PPTX using LibreOffice.", True, "PowerPoint (*.ppt *.pptx)", True),
-    ToolDef("xls2pdf", "Excel to PDF", "Convert to PDF", "X", "Batch convert XLS/XLSX using LibreOffice.", True, "Excel files (*.xls *.xlsx)", True),
-    ToolDef("html2pdf", "HTML to PDF", "Convert to PDF", "🌐", "Convert a local HTML page or URL using WeasyPrint."),
+    ToolDef("img2pdf", "JPG / Image to PDF", "Convert to PDF", "🖼", "Convert one or more images (JPG, PNG, TIFF, WebP, HEIC…) into one PDF.", True, "Images (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp *.gif *.heic *.heif)"),
+    ToolDef("word2pdf", "Word to PDF", "Convert to PDF", "W", "Batch convert Word / OpenDocument / RTF files with LibreOffice.", True, "Documents (*.doc *.docx *.odt *.rtf *.txt)", True),
+    ToolDef("ppt2pdf", "PowerPoint to PDF", "Convert to PDF", "P", "Batch convert PowerPoint / Impress slides with LibreOffice.", True, "Presentations (*.ppt *.pptx *.pps *.ppsx *.odp)", True),
+    ToolDef("xls2pdf", "Excel to PDF", "Convert to PDF", "X", "Batch convert Excel / Calc sheets and CSV with LibreOffice.", True, "Spreadsheets (*.xls *.xlsx *.ods *.csv)", True),
+    ToolDef("html2pdf", "HTML to PDF", "Convert to PDF", "🌐", "Save a web page (URL) or a local HTML file as PDF, using Edge / Chrome when installed."),
 
     ToolDef("pdf2jpg", "PDF to JPG", "Convert from PDF", "🖼", "Batch render every PDF page to JPG images.", True, batchable=True),
-    ToolDef("pdf2word", "PDF to Word", "Convert from PDF", "W", "Batch convert PDFs to DOCX with pdf2docx.", True, batchable=True),
+    ToolDef("pdf2word", "PDF to Word", "Convert from PDF", "W", "Convert PDFs to editable Word documents (.docx) — whole files or chosen pages.", True, batchable=True),
     ToolDef("pdf2ppt", "PDF to PowerPoint", "Convert from PDF", "P", "Batch create PowerPoint decks from PDF pages.", True, batchable=True),
     ToolDef("pdf2xls", "PDF to Excel", "Convert from PDF", "X", "Batch extract detected tables to XLSX workbooks.", True, batchable=True),
     ToolDef("pdfa", "PDF to PDF/A", "Convert from PDF", "A", "Batch archival conversion through Ghostscript.", True, batchable=True),
@@ -735,14 +736,19 @@ def _win_signature_ok(path: Path, signer_hint: str) -> bool:
 
 def _win_run_elevated(exe: str, args: str, timeout: int = 3600) -> int:
     """Run an installer as administrator (Windows shows one Yes/No prompt) and wait for it."""
-    ps = ("$p = Start-Process -FilePath $env:PDFMULE_EXE -ArgumentList $env:PDFMULE_ARGS -Verb RunAs "
-          "-Wait -PassThru; exit $p.ExitCode")
+    # Not "Start-Process -Wait": that also waits for every process the installer leaves running
+    # (the Ghostscript installer does), so it never returned. Wait for the installer itself only.
+    ps = ("$p = Start-Process -FilePath $env:PDFMULE_EXE -ArgumentList $env:PDFMULE_ARGS -Verb RunAs -PassThru; "
+          "$null = $p.Handle; "   # keep the handle, or ExitCode stays empty for elevated processes
+          f"if (-not $p.WaitForExit({timeout * 1000})) {{ exit 1460 }}; exit [int]$p.ExitCode")
     env = dict(os.environ, PDFMULE_EXE=exe, PDFMULE_ARGS=args); env.pop("PSModulePath", None)
     code, out = _run_install_cmd(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
                                  timeout=timeout, env=env)
     if code != 0 and ("canceled by the user" in out.lower() or "cancelled by the user" in out.lower()):
         raise RuntimeError("The installation was cancelled at the Windows permission prompt. "
                            "Run the tool again and answer Yes.")
+    if code == 1460:
+        raise RuntimeError(f"The installer did not finish within {timeout // 60} minutes.")
     return code
 
 
@@ -775,14 +781,14 @@ def _install_windows(key: str, progress) -> None:
             if not _win_signature_ok(msi, "Document Foundation"):
                 raise RuntimeError("The LibreOffice download failed its signature check. Nothing was installed.")
             _say(progress, 65, f"Installing {info['label']} (answer Yes at the Windows prompt)…")
-            code = _win_run_elevated("msiexec.exe", f'/i "{msi}" /qn /norestart')
+            code = _win_run_elevated("msiexec.exe", f'/i "{msi}" /qn /norestart', timeout=2400)
             if code not in (0, 3010):
                 raise RuntimeError(f"The LibreOffice installer stopped with code {code}.")
             return
         if signer and not _win_signature_ok(exe, signer):
             raise RuntimeError(f"The {info['label']} download failed its signature check. Nothing was installed.")
         _say(progress, 65, f"Installing {info['label']} (answer Yes at the Windows prompt)…")
-        code = _win_run_elevated(str(exe), args)
+        code = _win_run_elevated(str(exe), args, timeout=900)
         if code != 0:
             raise RuntimeError(f"The {info['label']} installer stopped with code {code}.")
 
@@ -1130,6 +1136,7 @@ PYTHON_OPTIONAL_DEPS = [
     ("HTML → PDF", "weasyprint", "weasyprint"),
     ("PDF → Markdown", "pymupdf4llm", "pymupdf4llm"),
     ("Translate", "deep_translator", "deep-translator"),
+    ("iPhone photos (HEIC)", "pillow_heif", "pillow-heif"),
 ]
 
 EXTERNAL_OPTIONAL_DEPS = [
@@ -1231,14 +1238,50 @@ class Worker(QThread):
             self.failed.emit(traceback.format_exc())
 
 
+_ERROR_HINTS = [
+    (r"Permission denied|PermissionError|being used by another process|WinError 32",
+     "PDF Mule can't write the output there. If the file is open in another program (PDF viewer, Word, Excel), "
+     "close it and try again, or choose another folder."),
+    (r"No space left|WinError 112|disk is full", "The disk is full. Free some space or choose another drive."),
+    (r"MemoryError|cannot allocate|out of memory",
+     "Not enough memory for this file. Choose the “Low memory” profile, or split the PDF into parts first."),
+    (r"cannot open broken document|FzErrorFormat|format error|no objects found|not a PDF",
+     "The PDF looks damaged. Run “Repair PDF” on it first, then try again."),
+    (r"FileNotFoundError|No such file or directory",
+     "A file could not be found. It may have been moved, renamed or deleted — add it again."),
+    (r"timed out|TimeoutError|ConnectionError|URLError|getaddrinfo|Name or service not known",
+     "No Internet connection (or the server did not answer). Check the connection and try again."),
+]
+
+
 def friendly_error(tb: str) -> str:
-    """Last meaningful line of a traceback, without the exception class noise."""
+    """A plain-language message for the user: our own messages as they are, common system errors
+    explained, otherwise the last meaningful line of the traceback."""
     lines = [l for l in (tb or "").strip().splitlines() if l.strip()]
     if not lines:
         return "Unknown error"
     last = lines[-1]
     m = re.match(r"^[\w.]+(Error|Exception|Warning)?:\s*(.*)$", last)
-    return (m.group(2) if m and m.group(2) else last).strip()
+    msg = (m.group(2) if m and m.group(2) else last).strip()
+    own = re.match(r"^(ValueError|RuntimeError):", last)
+    if not own:
+        for pattern, hint in _ERROR_HINTS:
+            if re.search(pattern, tb or "", re.I):
+                return hint
+    return msg
+
+
+def save_error_details(tool: str, tb: str) -> Optional[Path]:
+    """Keep the technical details in ~/.pdf_mule/logs/errors.log (newest last, file kept small)."""
+    try:
+        logs = APP_HOME / "logs"; logs.mkdir(parents=True, exist_ok=True)
+        f = logs / "errors.log"
+        old = f.read_text(encoding="utf-8")[-200_000:] if f.exists() else ""
+        f.write_text(old + f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} · {APP_NAME} {APP_VERSION} · {tool} "
+                     f"· {sys.platform}\n{tb.strip()}\n", encoding="utf-8")
+        return f
+    except Exception:
+        return None
 
 
 # ----------------------------- Engines -----------------------------
@@ -1493,6 +1536,24 @@ def eng_organize(progress, files, out, opts):
 _PAPER_SIZES = {"A4": (595.28, 841.89), "Letter": (612.0, 792.0), "A3": (841.89, 1190.55)}
 
 
+def _enable_heic(files, progress=None) -> None:
+    """iPhone photos (.heic/.heif) need pillow-heif: installed when such a file is added."""
+    if not any(Path(f).suffix.lower() in (".heic", ".heif") for f in files):
+        return
+    try:
+        import pillow_heif
+    except Exception:
+        if getattr(sys, "frozen", False):
+            raise RuntimeError("This build cannot open HEIC photos.")
+        _say(progress, 2, "Installing support for iPhone photos (one time only)…")
+        ok, log = _pip_install(["pillow-heif"]); importlib.invalidate_caches()
+        try:
+            import pillow_heif
+        except Exception:
+            raise RuntimeError("Support for HEIC photos could not be installed:\n" + log[-400:])
+    pillow_heif.register_heif_opener()
+
+
 def _images_to_pdf(progress, files, out, opts):
     """Build one PDF from images, streaming one frame at a time.
 
@@ -1506,6 +1567,7 @@ def _images_to_pdf(progress, files, out, opts):
     from PIL import ImageSequence, ImageOps
     if not files:
         raise ValueError("No images selected.")
+    _enable_heic(files, progress)
     page_mode = str(opts.get("page_size", "Image size (DPI)"))
     margin = mm_to_pt(float(opts.get("margin_mm", 0) or 0))
     doc = fitz.open(); total = len(files); pages_added = 0; skipped = []
@@ -1540,7 +1602,7 @@ def _images_to_pdf(progress, files, out, opts):
                             elif fr.mode not in ("RGB", "L", "1"):
                                 fr = fr.convert("RGB")
                             bio = io.BytesIO()
-                            if im.format in ("JPEG", "WEBP", "MPO") and fr.mode != "1":
+                            if im.format in ("JPEG", "WEBP", "MPO", "HEIF") and fr.mode != "1":
                                 fr.save(bio, "JPEG", quality=92)
                             else:
                                 fr.save(bio, "PNG", compress_level=6)
@@ -2031,21 +2093,77 @@ def eng_office2pdf(progress, files, out, opts):
     return str(out_dir) if len(made) != 1 else made[0]
 
 
+def find_browser() -> Optional[str]:
+    """A Chromium-based browser that can print to PDF headless (Edge ships with Windows 10/11)."""
+    cands = []
+    if sys.platform == "win32":
+        for root in filter(None, [os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),
+                                  os.environ.get("LOCALAPPDATA")]):
+            cands += [os.path.join(root, "Microsoft", "Edge", "Application", "msedge.exe"),
+                      os.path.join(root, "Google", "Chrome", "Application", "chrome.exe"),
+                      os.path.join(root, "BraveSoftware", "Brave-Browser", "Application", "brave.exe")]
+    elif sys.platform == "darwin":
+        for app, exe in (("Google Chrome", "Google Chrome"), ("Microsoft Edge", "Microsoft Edge"),
+                         ("Chromium", "Chromium"), ("Brave Browser", "Brave Browser")):
+            for base in ("/Applications", os.path.expanduser("~/Applications")):
+                cands.append(f"{base}/{app}.app/Contents/MacOS/{exe}")
+    for c in cands:
+        if Path(c).exists():
+            return c
+    for n in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge", "brave-browser"):
+        x = shutil.which(n)
+        if x:
+            return x
+    return None
+
+
+def _html_via_browser(browser: str, source: str, out: str, progress) -> bool:
+    url = source if re.match(r"^[a-z]+://", source, re.I) else Path(source).resolve().as_uri()
+    tmp = out + ".part"
+    with tempfile.TemporaryDirectory(prefix="pdfmule_web_") as prof:
+        cmd = [browser, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+               f"--user-data-dir={prof}", "--no-pdf-header-footer", "--print-to-pdf-no-header",
+               "--run-all-compositor-stages-before-draw", "--virtual-time-budget=8000",
+               f"--print-to-pdf={tmp}", url]
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            cmd.insert(1, "--no-sandbox")   # Chromium refuses to run as root otherwise (Linux)
+        progress(30, f"Printing the page with {Path(browser).stem}…")
+        cp = run_quiet(cmd, timeout=180)
+    try:
+        if Path(tmp).exists() and Path(tmp).stat().st_size > 500:
+            os.replace(tmp, out); return True
+        progress(40, f"⚠ {Path(browser).stem} could not print the page ({(cp.stderr or '').strip()[-160:]})")
+        return False
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
 def eng_html2pdf(progress, files, out, opts):
+    source = (opts.get("source") or "").strip().strip('"')
+    if not source:
+        raise ValueError("Enter a web address (https://…) or choose a local HTML file.")
+    if not re.match(r"^[a-z]+://", source, re.I):
+        if re.match(r"^(www\.|[\w-]+\.[a-z]{2,})(/|$)", source, re.I) and not Path(source).exists():
+            source = "https://" + source          # "example.com" typed without https://
+        elif not Path(source).exists():
+            raise ValueError(f"File not found: {source}")
+    browser = find_browser()
+    if browser and _html_via_browser(browser, source, out, progress):
+        progress(100, "Done"); return out
     try:
         from weasyprint import HTML
     except Exception:
-        raise RuntimeError("HTML to PDF needs WeasyPrint. Install it from Dependency status "
-                           "(on Windows WeasyPrint also needs the GTK/Pango runtime).")
-    source = (opts.get("source") or "").strip().strip('"')
-    if not source:
-        raise ValueError("Enter a URL or local HTML file path.")
+        if not re.match(r"^[a-z]+://", source, re.I):
+            progress(50, "Converting with LibreOffice…")
+            res = eng_office2pdf(progress, [source], str(Path(out).parent / ("_html_" + Path(out).stem)), {})
+            os.replace(res, out); shutil.rmtree(Path(res).parent, ignore_errors=True)
+            progress(100, "Done"); return out
+        raise RuntimeError("Saving web pages needs Microsoft Edge, Google Chrome or Chromium. Install one of them "
+                           "and try again.")
     progress(20, "Loading HTML")
     if re.match(r"^[a-z]+://", source, re.I):
         html = HTML(url=source)
     else:
-        if not Path(source).exists():
-            raise ValueError(f"File not found: {source}")
         html = HTML(filename=source)
     tmp = out + ".part"
     try:
@@ -2073,19 +2191,101 @@ def eng_pdf2jpg(progress, files, out, opts):
     return str(out_dir)
 
 
+def _png_compatible_pixmap(pix):
+    """PNG can only hold Gray or RGB (+alpha). Convert CMYK / ICC-based / Separation / DeviceN / Lab
+    pixmaps to RGB, and alpha-only masks to gray."""
+    try:
+        return fitz.Pixmap(fitz.csRGB, pix)
+    except Exception:
+        pass
+    if pix.colorspace is None or pix.n == pix.alpha:   # alpha-only (stencil) mask
+        alpha = bytes(pix.samples)[pix.n - 1::pix.n] if pix.n > 1 else bytes(pix.samples)
+        img = Image.frombytes("L", (pix.width, pix.height), bytes(255 - a for a in alpha))
+        import io
+        bio = io.BytesIO(); img.save(bio, "PNG")
+        return fitz.Pixmap(bio.getvalue())
+    raise ValueError(f"unsupported image colour space {pix.colorspace}")
+
+
+class _PngSafePixmaps:
+    """While active, Pixmap.tobytes() converts images PNG cannot store instead of failing. pdf2docx
+    writes every picture as PNG and stops on CMYK/ICC images with "pixmap must be grayscale or rgb"."""
+    _lock = _threading.Lock()
+
+    def __enter__(self):
+        self._lock.acquire()
+        self._orig = fitz.Pixmap.tobytes
+        orig = self._orig
+
+        def tobytes(pix, output="png", *args, **kwargs):
+            try:
+                return orig(pix, output, *args, **kwargs)
+            except Exception as exc:
+                msg = str(exc).lower()
+                if str(output).lower() in ("png", "pnm", "pgm", "ppm", "pbm", "pam", "psd") or \
+                        "grayscale or rgb" in msg or "unsupported colorspace" in msg:
+                    return orig(_png_compatible_pixmap(pix), output, *args, **kwargs)
+                raise
+        fitz.Pixmap.tobytes = tobytes
+        return self
+
+    def __exit__(self, *exc):
+        fitz.Pixmap.tobytes = self._orig
+        self._lock.release()
+        return False
+
+
+class _Pdf2DocxProgress(logging.Handler):
+    """pdf2docx reports "(3/120) Page 3" while parsing and while creating pages: turn it into progress."""
+    def __init__(self, progress):
+        super().__init__(logging.INFO); self.progress = progress; self.phase = 0
+
+    def emit(self, record):
+        msg = record.getMessage()
+        if "[3/4]" in msg: self.phase = 0
+        elif "[4/4]" in msg: self.phase = 1
+        m = re.search(r"\((\d+)/(\d+)\)\s*Page", msg)
+        if m:
+            i, n = int(m.group(1)), max(1, int(m.group(2)))
+            base, span = (10, 60) if self.phase == 0 else (70, 28)
+            self.progress(base + span * i // n, f"{'Analysing' if self.phase == 0 else 'Writing'} page {i}/{n}")
+
+
 def eng_pdf2word(progress, files, out, opts):
     try:
         from pdf2docx import Converter
     except Exception:
-        raise RuntimeError("PDF to Word needs pdf2docx. Install optional packages from Dependency status.")
-    progress(10, "Reading PDF (layout analysis can take a while for long documents)")
+        if getattr(sys, "frozen", False):
+            raise RuntimeError("This build has no PDF → Word module.")
+        progress(2, "Installing the PDF → Word module (one time only)…")
+        ok, log = _pip_install(["pdf2docx"]); importlib.invalidate_caches()
+        try:
+            from pdf2docx import Converter
+        except Exception:
+            raise RuntimeError("The PDF → Word module could not be installed:\n" + log[-500:])
+    password = (opts.get("passwords") or {}).get(files[0]) or opts.get("input_password") or None
+    progress(5, "Reading PDF (layout analysis can take a while for long documents)")
     tmp = out + ".part.docx"
-    cv = Converter(files[0], password=opts.get("input_password") or None)
+    handler = _Pdf2DocxProgress(progress)
+    root = logging.getLogger()
+    old_level = root.level
+    root.addHandler(handler); root.setLevel(min(old_level or logging.WARNING, logging.INFO))
     try:
-        cv.convert(tmp)
+        with _PngSafePixmaps():
+            cv = Converter(files[0], password=password)
+            try:
+                spec = (opts.get("pages") or "").strip()
+                pages = page_set(spec, len(cv.fitz_doc)) if spec else None
+                if pages is not None:
+                    cv.convert(tmp, pages=pages)
+                else:
+                    cv.convert(tmp)
+            finally:
+                cv.close()
+        os.replace(tmp, out)
     finally:
-        cv.close()
-    os.replace(tmp, out)
+        root.removeHandler(handler); root.setLevel(old_level)
+        Path(tmp).unlink(missing_ok=True)
     progress(100, "Done"); return out
 
 
@@ -4357,7 +4557,7 @@ class VisualSplitDialog(QDialog):
         box=QMessageBox(self); box.setIcon(QMessageBox.Icon.Information); box.setWindowTitle("Split PDF"); box.setText(f"{last}\nTime: {took}\n\n{self.result_path}")
         ob=box.addButton("Open folder",QMessageBox.ButtonRole.ActionRole); box.addButton(QMessageBox.StandardButton.Ok); box.exec()
         if box.clickedButton()==ob: open_folder(self.result_path)
-    def on_fail(self,error):self.worker=None;self._unlock_ui();self.status.setText("✗ Split failed");QMessageBox.critical(self,"Split PDF",friendly_error(error))
+    def on_fail(self,error):self.worker=None;self._unlock_ui();self.status.setText("✗ Split failed");save_error_details("Split PDF",error);QMessageBox.critical(self,"Split PDF",friendly_error(error))
     def on_cancelled(self):self.worker=None;self._unlock_ui();self.progress.setValue(0);self.status.setText("Cancellation requested / job stopped safely.")
     def cancel_job(self):
         if self.worker and self.worker.isRunning():self.worker.requestInterruption();self.cancel_btn.setEnabled(False);self.status.setText("Cancelling… worker processes are being stopped.")
@@ -4582,8 +4782,11 @@ class ToolDialog(QDialog):
         body=QWidget(); body_l=QVBoxLayout(body); body_l.setContentsMargins(0,0,6,0); body_l.setSpacing(12)
         body_scroll=QScrollArea(); body_scroll.setWidgetResizable(True); body_scroll.setFrameShape(QFrame.Shape.NoFrame); body_scroll.setWidget(body)
 
-        file_box=QGroupBox("Input"); fl=QVBoxLayout(file_box)
-        self.files=QListWidget(); self.files.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection); self.files.setMinimumHeight(90); self.files.setMaximumHeight(150); fl.addWidget(self.files)
+        file_box=QGroupBox("Step 1 · Add your files" if tool.key!="html2pdf" else "Input"); fl=QVBoxLayout(file_box)
+        self.files=QListWidget(); self.files.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection); self.files.setMinimumHeight(90); self.files.setMaximumHeight(150)
+        self.files.setTextElideMode(Qt.TextElideMode.ElideMiddle); self.files.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.files.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)   # drag to change the order
+        fl.addWidget(self.files)
         drop_hint=QLabel("Tip: drag & drop files or folders here." + ("" if tool.multi else " This tool uses one file.")); drop_hint.setObjectName("heroSub"); fl.addWidget(drop_hint)
         QShortcut(QKeySequence("Delete"), self.files, activated=self.remove_selected_inputs, context=Qt.ShortcutContext.WidgetShortcut)
         btnrow=QHBoxLayout(); self.add_btn=QPushButton("＋ Add files"); self.add_folder_btn=QPushButton("＋ Add Folder"); self.rem_btn=QPushButton("Remove selected"); self.clear_btn=QPushButton("Clear")
@@ -4595,10 +4798,10 @@ class ToolDialog(QDialog):
         if tool.key == "html2pdf": file_box.setVisible(False)
         body_l.addWidget(file_box)
 
-        self.form_group=QGroupBox("Options"); self.form=QFormLayout(self.form_group); self.widgets={}; self._build_options(); body_l.addWidget(self.form_group)
+        self.form_group=QGroupBox("Step 1 · What to convert" if tool.key=="html2pdf" else "Step 2 · Choose options (the defaults are fine)"); self.form=QFormLayout(self.form_group); self.widgets={}; self._build_options(); body_l.addWidget(self.form_group)
 
         if tool.batchable:
-            perf=QGroupBox("Smart batch / performance"); pf=QFormLayout(perf)
+            perf=QGroupBox("Advanced · speed for many files (optional)"); pf=QFormLayout(perf)
             self.profile=QComboBox(); self.profile.addItems(["Smart / Auto","Balanced","Maximum speed","Low memory","Single worker"]); self.profile.currentTextChanged.connect(self.apply_profile); pf.addRow("Processing profile:",self.profile)
             self.worker_spin=QSpinBox(); self.worker_spin.setRange(1,max(1,min(16,os.cpu_count() or 4))); self.worker_spin.setValue(min(4,os.cpu_count() or 2)); pf.addRow("Parallel file workers:",self.worker_spin)
             self.continue_errors=QCheckBox("Continue batch when one file fails"); self.continue_errors.setChecked(True); pf.addRow("",self.continue_errors)
@@ -4609,12 +4812,12 @@ class ToolDialog(QDialog):
         self.log=QPlainTextEdit(); self.log.setReadOnly(True); self.log.setMaximumHeight(105); self.log.setMaximumBlockCount(3000); self.log.setPlaceholderText("Processing log…"); root.addWidget(self.log)
         self.progress=QProgressBar(); self.progress.setRange(0,100); self.progress.setValue(0); root.addWidget(self.progress)
         row=QHBoxLayout(); self.open_btn=QPushButton("Open output folder"); self.open_btn.setEnabled(False); self.open_btn.clicked.connect(self.open_result); self.cancel_btn=QPushButton("Cancel job"); self.cancel_btn.setEnabled(False); self.cancel_btn.clicked.connect(self.cancel_job)
-        row.addWidget(self.open_btn); row.addWidget(self.cancel_btn); row.addStretch(); close=QPushButton("Close"); close.clicked.connect(self.request_close); self.run_btn=QPushButton(f"Run {tool.title}"); self.run_btn.setObjectName("primary"); self.run_btn.clicked.connect(self.run_tool); row.addWidget(close); row.addWidget(self.run_btn); root.addLayout(row)
+        row.addWidget(self.open_btn); row.addWidget(self.cancel_btn); row.addStretch(); close=QPushButton("Close"); close.clicked.connect(self.request_close); self.run_btn=QPushButton(f"Step 3 · Run {tool.title}" if tool.key!="html2pdf" else f"Step 2 · Run {tool.title}"); self.run_btn.setObjectName("primary"); self.run_btn.clicked.connect(self.run_tool); row.addWidget(close); row.addWidget(self.run_btn); root.addLayout(row)
 
     def update_input_badge(self):
         n=self.files.count(); self.input_badge.setText(f"{n} file(s)")
         if hasattr(self,"run_btn"):
-            self.run_btn.setText(f"Run {self.tool.title}" + (f"  ·  {n} files" if n>1 and self.tool.batchable else ""))
+            self.run_btn.setText(f"Step 3 · Run {self.tool.title}" + (f"  ·  {n} files" if n>1 and self.tool.batchable else ""))
     def _add_paths(self,paths):
         """Add files (and folders, scanned recursively) honouring this tool's file filter."""
         suffixes=filter_suffixes(self.tool.extensions)
@@ -4628,10 +4831,10 @@ class ToolDialog(QDialog):
         if not found: return 0
         if not self.tool.multi:
             self.files.clear(); found=found[:1]
-        existing={self.files.item(i).text() for i in range(self.files.count())}
+        existing=set(self.input_paths())
         added=0
         for f in found:
-            if f not in existing: self.files.addItem(f); existing.add(f); added+=1
+            if f not in existing: self.files.addItem(self._input_item(f)); existing.add(f); added+=1
         self.update_input_badge(); return added
     def dragEnterEvent(self,e):
         if e.mimeData().hasUrls() and (self.worker is None): e.acceptProposedAction()
@@ -4642,6 +4845,16 @@ class ToolDialog(QDialog):
         e.acceptProposedAction()
     def remove_selected_inputs(self):
         for i in sorted((self.files.row(x) for x in self.files.selectedItems()),reverse=True): self.files.takeItem(i)
+        self.update_input_badge()
+    def input_paths(self):
+        return [self.files.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.files.count())]
+    def _input_item(self,path):
+        P=Path(path)
+        try: size=fmt_size(P.stat().st_size)
+        except OSError: size="?"
+        it=QListWidgetItem(f"{P.name}     ·  {size}  ·  {P.parent}")
+        it.setData(Qt.ItemDataRole.UserRole,str(P)); it.setToolTip(str(P))
+        return it
     def line(self,key,label,placeholder="",password=False):
         w=QLineEdit(); w.setPlaceholderText(placeholder); w.setEchoMode(QLineEdit.EchoMode.Password if password else QLineEdit.EchoMode.Normal); self.widgets[key]=w; self.form.addRow(label,w); return w
     def combo(self,key,label,items):
@@ -4670,7 +4883,10 @@ class ToolDialog(QDialog):
             self.check("skip_text_pages","Skip pages that already contain text (keeps them untouched)",True)
             self.check("auto_rotate","Auto-straighten upside-down / sideways scans (Tesseract OSD)",True)
             self._note("The output keeps the original page images and adds an invisible, searchable text layer.")
-        if k=="html2pdf": self.line("source","URL or HTML path","https://example.com or C:\\page.html")
+        if k=="html2pdf":
+            src=self.line("source","Web address or HTML file","https://example.com  or  C:\\page.html")
+            b=QPushButton("Choose an HTML file…"); b.clicked.connect(lambda:self._pick_to_line(src,"Web pages (*.html *.htm *.xhtml *.mhtml)")); self.form.addRow("",b)
+            self._note("Uses Microsoft Edge or Google Chrome to print the page exactly as a browser shows it.")
         if k=="pdf2jpg": self.spin("dpi","DPI",72,600,180); self.spin("quality","JPG quality",40,100,90)
         if k=="pdfa": self.combo("pdfa","PDF/A level",["1","2","3"])
         if k=="rotate":
@@ -4704,6 +4920,13 @@ class ToolDialog(QDialog):
             self.translate_language_selector=TranslateLanguageSelector(self)
             self.form.addRow("Translation language:", self.translate_language_selector)
         if k=="workflow": self.line("password","Optional output password","Leave blank for no encryption",True)
+        if k=="pdf2word":
+            self.line("pages","Pages (blank = all)","Example: 1-20  ·  45-end")
+            self._note("Big books take a while (roughly 1–3 seconds per page). Converting only the pages you need is faster.")
+        need={"ocr":"tesseract","word2pdf":"libreoffice","ppt2pdf":"libreoffice","xls2pdf":"libreoffice","pdfa":"ghostscript"}.get(k)
+        if need and not PROGRAMS[need]["find"]():
+            self._note(f"ⓘ {PROGRAMS[need]['label']} is not on this computer yet: PDF Mule installs it by itself when you "
+                       "press Run (one time only; Windows asks you to answer Yes).")
         if self.form.rowCount()==0:self.form.addRow(QLabel("No extra options required."))
     def _note(self,text):
         n=QLabel(text); n.setWordWrap(True); n.setObjectName("heroSub"); self.form.addRow("",n); return n
@@ -4730,12 +4953,7 @@ class ToolDialog(QDialog):
         if not files:
             QMessageBox.information(self,"Add Folder",f"No supported files were found in this folder or its subfolders.\n\nExpected: {self.tool.extensions}")
             return
-        existing={self.files.item(i).text() for i in range(self.files.count())}
-        added=0
-        for f in files:
-            if f not in existing:
-                self.files.addItem(f); existing.add(f); added+=1
-        self.update_input_badge()
+        added=self._add_paths(files)
         self.log.appendPlainText(f"[INPUT] Folder scan: {len(files)} matching file(s), {added} new file(s) added from {folder}")
     def apply_profile(self,text):
         if not self.worker_spin:return
@@ -4787,7 +5005,7 @@ class ToolDialog(QDialog):
         self.run_btn.setEnabled(not busy);self.cancel_btn.setEnabled(busy);self.add_btn.setEnabled(not busy);self.add_folder_btn.setEnabled(not busy);self.rem_btn.setEnabled(not busy);self.clear_btn.setEnabled(not busy);self.files.setEnabled(not busy);self.form_group.setEnabled(not busy)
         if self.profile:self.profile.setEnabled(not busy);self.worker_spin.setEnabled(not busy);self.continue_errors.setEnabled(not busy)
     def run_tool(self):
-        files=[self.files.item(i).text() for i in range(self.files.count())]
+        files=self.input_paths()
         if self.tool.key!="html2pdf" and not files:QMessageBox.warning(self,"No input","Add at least one input file first.");return
         if self.tool.key=="compare" and len(files)!=2:QMessageBox.warning(self,"Compare PDF","Select exactly two PDF files.");return
         if self.tool.key=="ocr" and self.ocr_language_selector is not None and self.ocr_language_selector.mode_text().startswith("Manual") and not self.ocr_language_selector.selected_codes():
@@ -4853,8 +5071,12 @@ class ToolDialog(QDialog):
         elif open_file_btn is not None and box.clickedButton()==open_file_btn: QDesktopServices.openUrl(QUrl.fromLocalFile(self.result_path))
     def on_fail(self,error):
         self.worker=None;self._lock_ui(False);self.progress.setValue(0)
-        self.log.appendPlainText("✗ Failed: "+friendly_error(error)); self.log.appendPlainText(error.strip())
-        QMessageBox.critical(self,f"{self.tool.title} failed",friendly_error(error))
+        msg=friendly_error(error); details=save_error_details(self.tool.title,error)
+        self.log.appendPlainText("✗ Failed: "+msg)
+        if details: self.log.appendPlainText(f"   Technical details were saved to {details}")
+        box=QMessageBox(self); box.setIcon(QMessageBox.Icon.Critical); box.setWindowTitle(f"{self.tool.title} failed")
+        box.setText(msg); box.setDetailedText(error.strip()[-6000:])
+        box.addButton(QMessageBox.StandardButton.Ok); box.exec()
     def on_cancelled(self):self.worker=None;self._lock_ui(False);self.progress.setValue(0);self.log.appendPlainText("■ Cancellation requested / job stopped safely.")
     def cancel_job(self):
         if self.worker is not None and self.worker.isRunning():self.worker.requestInterruption();self.cancel_btn.setEnabled(False);self.log.appendPlainText("Cancelling… (a single long step such as a Word conversion finishes first)")
@@ -5286,9 +5508,29 @@ def _http(url, timeout=15):
     return urllib.request.urlopen(req, timeout=timeout, context=_tls_context())
 
 
+_STAGES = {"alpha": 0, "a": 0, "beta": 1, "b": 1, "rc": 2}
+
+
 def _ver(v) -> tuple:
-    nums = [int(n) for n in re.findall(r"\d+", str(v))[:3]]
-    return tuple(nums + [0] * (3 - len(nums))) if nums else (0, 0, 0)
+    """Comparable version: 1.7.0-rc1 < 1.7.0-rc2 < 1.7.0 < 1.7.1."""
+    m = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-.\s]?(alpha|beta|rc|a|b)\.?(\d*))?", str(v).lower())
+    if not m:
+        return (0, 0, 0, 3, 0)
+    major, minor, patch = (int(x) if x else 0 for x in m.group(1, 2, 3))
+    stage = _STAGES.get(m.group(4), 3) if m.group(4) else 3
+    return (major, minor, patch, stage, int(m.group(5) or 0))
+
+
+def is_prerelease(v: str) -> bool:
+    return _ver(v)[3] < 3
+
+
+def get_test_versions() -> bool:
+    """Release candidates are offered to people running one, or who switched it on in About."""
+    try:
+        return bool(load_settings().get("test_versions", is_prerelease(APP_VERSION)))
+    except Exception:
+        return is_prerelease(APP_VERSION)
 
 
 def _plain_notes(md: str, limit: int = 1400) -> str:
@@ -5327,7 +5569,15 @@ def app_update_check(progress=None):
     """Newest release for this platform: dict(version, notes, page, asset_url, sha256, name) or None."""
     import urllib.error
     try:
-        data = json.loads(_http_get(RELEASES_API, 2_000_000, "application/vnd.github+json", timeout=20))
+        if get_test_versions():
+            listing = json.loads(_http_get(RELEASES_API.rsplit("/", 1)[0] + "?per_page=20", 4_000_000,
+                                           "application/vnd.github+json", timeout=20))
+            listing = [r for r in listing if not r.get("draft")]
+            if not listing:
+                raise urllib.error.HTTPError(RELEASES_API, 404, "no releases", None, None)
+            data = max(listing, key=lambda r: _ver(r.get("tag_name") or "0"))
+        else:
+            data = json.loads(_http_get(RELEASES_API, 2_000_000, "application/vnd.github+json", timeout=20))
     except urllib.error.HTTPError as e:
         if e.code == 404 and not FROZEN:
             return _raw_main_check()   # no release published yet: the script on main
@@ -5368,8 +5618,10 @@ def app_update_check(progress=None):
 
 def _raw_main_check():
     text = _http_get(APP_UPDATE_URL, 16 * 1024 * 1024).decode("utf-8")
-    m = re.search(r'^APP_VERSION = "([0-9.]+)"', text, re.M)
+    m = re.search(r'^APP_VERSION = "([0-9][0-9A-Za-z.\-]*)"', text, re.M)
     if not m or _ver(m.group(1)) <= _ver(APP_VERSION):
+        return None
+    if is_prerelease(m.group(1)) and not get_test_versions():
         return None
     ver = m.group(1)
     return {"version": ver, "notes": "", "page": APP_PAGE, "asset_url": APP_UPDATE_URL, "sha256": None,
@@ -5468,7 +5720,7 @@ def clean_old_versions():
             for f in me.parent.glob(f"PDFMule_v*{kind}"):
                 if f.resolve() == me:
                     continue
-                m = re.match(r"PDFMule_v([\d.]+)", f.name)
+                m = re.match(r"PDFMule_v(.+?)(?:-windows|-linux|-macos|\.pyw)", f.name)
                 if m and _ver(m.group(1)) < _ver(APP_VERSION):
                     try:
                         f.unlink()
@@ -5520,7 +5772,10 @@ def offer_app_update(parent, info, quiet=False):
             QMessageBox.critical(parent, "Update", f"{APP_NAME} {ver} was installed but could not be started: {e}\n\n"
                                                     f"Start it yourself: {path}")
             return
-        QTimer.singleShot(8000, QApplication.quit)   # in case the new copy cannot ask this one to close
+        def quit_if_idle():   # in case the new copy cannot ask this one to close
+            if QApplication.activeModalWidget() is None:
+                QApplication.quit()
+        QTimer.singleShot(8000, quit_if_idle)
 
     def fail(err):
         dlg.close()
@@ -5560,7 +5815,15 @@ def run_update_check(parent, quiet: bool):
     """Background check (never blocks the window); the result is shown on the GUI thread."""
     w = Worker(app_update_check)
     parent._update_worker = w   # keep a reference while it runs
-    w.finished_ok.connect(lambda r: offer_app_update(parent, r, quiet))
+
+    def offer_when_free(r, tries=[0]):
+        # A background check never interrupts work: wait until no tool window is open.
+        if quiet and r and QApplication.activeModalWidget() is not None and tries[0] < 360:
+            tries[0] += 1
+            QTimer.singleShot(20000, lambda: offer_when_free(r))
+            return
+        offer_app_update(parent, r, quiet)
+    w.finished_ok.connect(offer_when_free)
     if not quiet:
         w.failed.connect(lambda e: QMessageBox.warning(parent, "Updates", "Could not check for updates:\n" + friendly_error(e)))
     w.start()
@@ -6016,7 +6279,12 @@ class MainWindow(QMainWindow):
         chk.setChecked(bool(self.settings.get("update_check", True)) and ota_supported())
         chk.setEnabled(ota_supported())
         chk.toggled.connect(lambda v: (self.settings.__setitem__("update_check", bool(v)), save_settings(self.settings)))
-        upd_row.addWidget(chk); upd_row.addStretch()
+        upd_row.addWidget(chk)
+        rc = QCheckBox("Also offer test versions (release candidates)")
+        rc.setChecked(bool(self.settings.get("test_versions", is_prerelease(APP_VERSION))))
+        rc.setToolTip("Release candidates are nearly finished versions for testing before the final release.")
+        rc.toggled.connect(lambda v: (self.settings.__setitem__("test_versions", bool(v)), save_settings(self.settings)))
+        upd_row.addWidget(rc); upd_row.addStretch()
         gh = QPushButton("GitHub page"); gh.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(APP_PAGE)))
         cu = QPushButton("Check for updates"); cu.setObjectName("primary")
         cu.clicked.connect(lambda: run_update_check(dlg, quiet=False))
@@ -6043,7 +6311,7 @@ class MainWindow(QMainWindow):
         """Shared by drag & drop and command-line arguments ("Open with PDF Mule")."""
         files=[]
         for p in paths:
-            if Path(p).is_dir(): files.extend(collect_folder_files(p,"*.pdf *.jpg *.jpeg *.png *.bmp *.tif *.tiff *.doc *.docx *.ppt *.pptx *.xls *.xlsx",True))
+            if Path(p).is_dir(): files.extend(collect_folder_files(p,"*.pdf *.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp *.gif *.heic *.heif *.doc *.docx *.odt *.rtf *.ppt *.pptx *.odp *.xls *.xlsx *.ods",True))
             elif Path(p).is_file(): files.append(p)
         if not files: return
         exts={Path(f).suffix.lower() for f in files}

@@ -6,7 +6,7 @@ raise APP_VERSION in PDFMule.pyw, update RELEASE_NOTES.md, push to main.
 
 To build by hand on Windows (same options as the workflow):
 
-  py -m pip install --upgrade pyinstaller pillow certifi PyQt6 PyMuPDF pytesseract openpyxl python-pptx pdf2docx deep-translator "pymupdf4llm<1"
+  py -m pip install --upgrade pyinstaller pillow certifi PyQt6 PyMuPDF pytesseract openpyxl python-pptx pdf2docx deep-translator pillow-heif "pymupdf4llm<1"
   py tools\build_info.py
   py -m PyInstaller --noconfirm --onefile --windowed --name PDFMule_v<version>-windows-x64 ^
      --icon pdf_mule_icon.ico --manifest PDFMule.manifest --version-file win_version.txt ^
