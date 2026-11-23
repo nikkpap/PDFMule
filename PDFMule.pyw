@@ -29,8 +29,8 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Any
 
 APP_NAME = "PDF Mule"
-APP_VERSION = "1.7.0-rc1"
-BUILD_DATE = "2026-11-22"
+APP_VERSION = "1.7.0-rc2"
+BUILD_DATE = "2026-11-23"
 APP_HOME = Path.home() / ".pdf_mule"
 SETTINGS_FILE = APP_HOME / "settings.json"
 try:
@@ -2878,18 +2878,69 @@ def _translation_source_text(progress, pdf_path: str, opts: dict) -> tuple[str, 
     return "\n\n".join(assembled), len(ocr_indexes), ocr_lang
 
 
-def _translate_with_retry(translator, chunk: str, attempts: int = 4) -> str:
-    last = None
-    for attempt in range(attempts):
-        try:
-            res = translator.translate(chunk)
+class TranslateLimited(RuntimeError):
+    """Google kept refusing (rate limit) or the connection kept failing."""
+
+
+_TRANSLATE_LOCK = _threading.Lock()
+_TRANSLATE_LAST = [0.0]
+TRANSLATE_GAP = 1.5            # seconds between requests: well under Google's 5 per second
+RATE_LIMIT_WAITS = (20, 45, 90, 150, 240)
+OTHER_WAITS = (3, 8, 20)
+
+
+def _is_rate_limit(exc) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return "toomanyrequests" in text or "too many requests" in text or "429" in text
+
+
+def _wait(progress, seconds: float, why: str):
+    """Sleep in small steps so Cancel still works, with a visible countdown."""
+    progress(None, f"⚠ {why} — waiting {int(seconds)} s, then trying again")
+    end = time.monotonic() + seconds
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        progress(None, None)   # Cancel still works while waiting
+        time.sleep(min(0.5, left))
+
+
+def _translate_with_retry(translator, chunk: str, progress=None) -> str:
+    """One request at a time, at most one every TRANSLATE_GAP seconds; when Google says "too many
+    requests" PDF Mule waits longer and longer (up to ~9 minutes in total) before giving up."""
+    progress = progress or (lambda *a: None)
+    limited = other = 0
+    while True:
+        with _TRANSLATE_LOCK:
+            gap = TRANSLATE_GAP - (time.monotonic() - _TRANSLATE_LAST[0])
+            if gap > 0:
+                time.sleep(gap)
+            try:
+                res = translator.translate(chunk)
+                exc = None
+            except Exception as e:   # noqa: BLE001 - provider errors are retried below
+                exc = e
+            finally:
+                _TRANSLATE_LAST[0] = time.monotonic()
+        if exc is None:
             return res if isinstance(res, str) else (chunk if res is None else str(res))
-        except Exception as exc:
-            last = exc
-            if attempt + 1 < attempts:
-                time.sleep(1.0 + attempt * 2.0)
-    raise RuntimeError(f"Translation provider failed after {attempts} attempts "
-                       f"(check the Internet connection): {last}")
+        if _is_rate_limit(exc):
+            if limited >= len(RATE_LIMIT_WAITS):
+                raise TranslateLimited("Google Translate is limiting requests from this Internet connection right now.")
+            _wait(progress, RATE_LIMIT_WAITS[limited], "Google asks to slow down")
+            limited += 1
+        else:
+            if other >= len(OTHER_WAITS):
+                raise TranslateLimited(f"The translation service did not answer ({exc}).")
+            _wait(progress, OTHER_WAITS[other], "Translation service did not answer")
+            other += 1
+
+
+def _translation_cache_file(text: str, source: str, target: str) -> Path:
+    import hashlib
+    key = hashlib.sha1(f"{source}>{target}\n{text}".encode("utf-8")).hexdigest()[:20]
+    return APP_HOME / "translate_cache" / f"{key}.json"
 
 
 def eng_translate(progress, files, out, opts):
@@ -2920,16 +2971,48 @@ def eng_translate(progress, files, out, opts):
     if not chunks:
         raise ValueError("No translatable text was found in this PDF.")
     translator = GoogleTranslator(source=source, target=target)
-    translated = []
-    for i, chunk in enumerate(chunks):
-        translated.append(_translate_with_retry(translator, chunk))
-        progress(32 + int((i + 1) * 64 / len(chunks)), f"Translating chunk {i+1}/{len(chunks)}")
+    # Finished parts are remembered, so running the same translation again (after a limit or a
+    # lost connection) continues where it stopped instead of starting over.
+    cache_file = _translation_cache_file(text, source, target)
+    try:
+        cache = json.loads(cache_file.read_text(encoding="utf-8")) if cache_file.exists() else {}
+    except Exception:
+        cache = {}
+    if cache:
+        progress(33, f"Continuing an earlier translation: {len(cache)} of {len(chunks)} part(s) already done")
+
+    def save_cache():
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
 
     header = (f"{APP_NAME} translated document\n"
               f"Source file: {Path(files[0]).name}\n"
               f"{detail}\n"
               f"{'-'*72}\n\n")
-    Path(out).write_text(header + "\n\n".join(translated), encoding="utf-8")
+    for i, chunk in enumerate(chunks):
+        if str(i) in cache:
+            continue
+        try:
+            cache[str(i)] = _translate_with_retry(translator, chunk, progress)
+        except TranslateLimited as exc:
+            save_cache()
+            done = len(cache)
+            partial = Path(out).with_name(Path(out).stem + "_PARTIAL" + Path(out).suffix)
+            parts = [cache.get(str(k), f"[not translated yet]\n{c}") for k, c in enumerate(chunks)]
+            partial.write_text(header.replace("translated document", f"PARTIAL translation ({done}/{len(chunks)} parts)")
+                               + "\n\n".join(parts), encoding="utf-8")
+            raise RuntimeError(f"{exc} {done} of {len(chunks)} parts are translated and saved in {partial.name}. "
+                               "Run Translate again in a few minutes: it continues from where it stopped.")
+        if i % 5 == 0:
+            save_cache()
+        progress(32 + int((len(cache)) * 64 / len(chunks)), f"Translating chunk {len(cache)}/{len(chunks)}")
+
+    Path(out).write_text(header + "\n\n".join(cache[str(i)] for i in range(len(chunks))), encoding="utf-8")
+    cache_file.unlink(missing_ok=True)
+    Path(out).with_name(Path(out).stem + "_PARTIAL" + Path(out).suffix).unlink(missing_ok=True)
     progress(100, "Translation completed")
     return out
 
@@ -3086,7 +3169,7 @@ def eng_batch(progress, files, out, opts):
     workers = effective_workers(opts, files)
     # Online translation providers throttle bursts: keep batch translation bounded.
     if engine_key == "translate":
-        workers = min(workers, 4 if opts.get("performance_profile") == "Maximum speed" else 2)
+        workers = 1   # Google allows only a few requests per second per connection: one file at a time
     # Tesseract is itself multi-threaded; two OCR processes are usually the sweet spot.
     if engine_key == "ocr":
         workers = min(workers, 2 if opts.get("performance_profile") != "Maximum speed" else workers)

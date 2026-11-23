@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.7.0-rc2 — translation no longer stops on Google's rate limit
+
+- Fix — Translate PDF failed with "You made too many requests to the server" on longer documents: requests now go one at a time with a pause between them (well under Google's 5 per second), and when Google still asks to slow down PDF Mule waits 20 s, 45 s, 90 s… (Cancel works while waiting) instead of giving up after 4 quick retries.
+- If Google keeps refusing, the parts already translated are saved as <name>_PARTIAL.txt, and running Translate again continues from where it stopped (finished parts are remembered in ~/.pdf_mule/translate_cache).
+- Batch translation handles one file at a time, so several files no longer trigger the limit.
+
 ## v1.7.0-rc1 — release candidate: review, fixes and easier tools
 
 Includes everything below from 1.6.1 (never released on its own), plus:

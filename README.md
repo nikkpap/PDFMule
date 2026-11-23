@@ -1,4 +1,4 @@
-# PDF Mule v1.7.0-rc1
+# PDF Mule v1.7.0-rc2
 
 A modern local-first PDF toolbox written in Python / PyQt6 and inspired by the category workflow of web PDF suites. PDF Mule is an independent project and is not affiliated with iLovePDF.
 
